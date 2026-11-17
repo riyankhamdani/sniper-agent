@@ -21,12 +21,11 @@ HEADERS = {
     "Accept": "application/json, text/html;q=0.9,*/*;q=0.8",
 }
 
-# Role WAJIB di Judul / Header
+# Role WAJIB di Judul / Header (Fokus ke Infra, Cloud, SRE, DevOps)
 INFRA_ROLE_REGEX = re.compile(
     r"\b(devops|sre|site reliability|platform"
     r" engineer|infrastructure|infra|kubernetes|k8s|cloud engineer|cloud"
-    r" architect|systems engineer|sysadmin|openshift|terraform|ansible|ai"
-    r" trainer|coding tasks|llm evaluation)\b",
+    r" architect|systems engineer|sysadmin|openshift|terraform|ansible)\b",
     re.IGNORECASE,
 )
 
@@ -50,6 +49,16 @@ GEO_EXCLUDE_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+# Blacklist proyek yang mewajibkan modal langganan AI atau API key pribadi (BYOK)
+BYOK_EXCLUDE_REGEX = re.compile(
+    r"(?:\b(?:own|your|personal|bring\s+your\s+own)\s+(?:api\s+keys?|api\s+credits?|openai\s+key|anthropic\s+key|subscription|account)\b|"
+    r"\bbyok\b|"
+    r"\b(?:claude\s+pro|chatgpt\s+plus|gpt[\s-]?4\s+subscription|cursor\s+pro|midjourney\s+subscription)\s+(?:required|needed|must\s+have)\b|"
+    r"\bmust\s+(?:have|provide|use)\s+(?:your\s+own\s+)?(?:claude\s+pro|chatgpt\s+plus|paid\s+ai|api\s+credits?)\b|"
+    r"\bself[\s-]?funded\s+(?:api|tokens?|compute)\b)",
+    re.IGNORECASE,
+)
+
 # Skill mapping profil CV Riyan Khamdani
 PROFILE_KEYWORDS = {
     "OpenShift / K8s": [
@@ -57,12 +66,15 @@ PROFILE_KEYWORDS = {
         "kubernetes",
         "k8s",
         "gke",
+        "eks",
+        "aks",
         "podman",
         "docker",
     ],
-    "IaC & Automation": ["terraform", "ansible", "ci/cd", "gitops"],
+    "IaC & Automation": ["terraform", "ansible", "ci/cd", "gitops", "argocd"],
     "Cloud & Linux": [
         "aws",
+        "azure",
         "gcp",
         "google cloud",
         "alibaba cloud",
@@ -70,13 +82,11 @@ PROFILE_KEYWORDS = {
         "linux",
     ],
     "Virtualization": ["vmware", "vsphere", "nsx-t", "zerto"],
-    "AI Infra / RLHF": [
+    "AI Infra & MLOps": [
         "ai platform",
         "dataiku",
         "mlops",
-        "llm",
-        "ai trainer",
-        "coding",
+        "gpu",
         "sre",
         "devops",
         "platform",
@@ -161,6 +171,11 @@ def is_valid_gig(
     ):
         return False
 
+    if BYOK_EXCLUDE_REGEX.search(combined_head) or BYOK_EXCLUDE_REGEX.search(
+        full_text
+    ):
+        return False
+
     if EXCLUDE_ROLES_REGEX.search(header_or_title):
         return False
 
@@ -197,7 +212,7 @@ def fetch_hn_freelance_gigs() -> list:
 
             query_str = (
                 "devops OR kubernetes OR terraform OR sre OR infrastructure OR aws OR"
-                " cloud"
+                " azure OR cloud"
             )
             comments_url = (
                 f"https://hn.algolia.com/api/v1/search"
@@ -345,52 +360,61 @@ def fetch_remoteok_contracts() -> list:
     return jobs
 
 
-def fetch_ai_coding_gigs() -> list:
-    """Karyawan 1 (Scout): Radar task-based AI Coding / Infra Evaluation."""
+def fetch_wwr_contracts() -> list:
+    """Karyawan 1 (Scout): Kontrak DevOps/Sysadmin dari RSS WeWorkRemotely."""
     jobs = []
-    boards = [
-        ("Turing (AI/Infra Task)", "turing"),
-        ("Scale AI (Coding/RLHF)", "scaleai"),
-    ]
-    for label, board_slug in boards:
-        try:
-            url = f"https://boards-api.greenhouse.io/v1/boards/{board_slug}/jobs"
-            res = requests.get(url, headers=HEADERS, timeout=12).json()
-            for item in res.get("jobs", []):
-                title = str(item.get("title") or "").strip()
-                loc = str(item.get("location", {}).get("name") or "").lower()
+    try:
+        url = "https://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss"
+        res = requests.get(url, headers=HEADERS, timeout=15)
+        items = re.findall(r"<item>(.*?)</item>", res.text, re.DOTALL)
 
-                if GEO_EXCLUDE_REGEX.search(f"{title} {loc}"):
-                    continue
+        for raw_item in items[:30]:
+            title_m = re.search(r"<title><!\[CDATA\[(.*?)\]\]></title>", raw_item)
+            link_m = re.search(r"<link>(.*?)</link>", raw_item)
+            desc_m = re.search(
+                r"<description><!\[CDATA\[(.*?)\]\]></description>",
+                raw_item,
+                re.DOTALL,
+            )
+            region_m = re.search(r"<region>(.*?)</region>", raw_item)
 
-                if re.search(
-                    r"\b(devops|kubernetes|cloud|infrastructure|sre|platform|ai"
-                    r" trainer|coding)\b",
-                    title,
-                    re.IGNORECASE,
-                ):
-                    if any(
-                        term in loc
-                        for term in ["remote", "indonesia", "apac", "anywhere", "global"]
-                    ):
-                        jobs.append({
-                            "source": label,
-                            "title": title,
-                            "company": label.split(" ")[0],
-                            "url": str(item.get("absolute_url") or ""),
-                            "date": str(item.get("updated_at") or "")[:10],
-                            "matches": ["AI Infra / RLHF", "Cloud & Linux"],
-                            "description": f"Role: {title} via {label}. Location: {loc}. Task-based AI infrastructure and coding evaluation.",
-                        })
-        except Exception as e:
-            print(f"[-] {label} error: {e}")
+            title = html.unescape(title_m.group(1)).strip() if title_m else ""
+            link = link_m.group(1).strip() if link_m else ""
+            desc = (
+                re.sub(r"<[^>]+>", " ", html.unescape(desc_m.group(1)))
+                if desc_m
+                else ""
+            )
+            region = region_m.group(1).strip().lower() if region_m else ""
 
-    print(f"[*] AI Task / Freelance Platform valid: {len(jobs)} listing")
+            header_meta = f"{title} | {region}"
+            if is_valid_gig(header_meta, desc, is_freelance_board=False):
+                matched = extract_matched_skills(f"{title} {desc}")
+                if matched:
+                    jobs.append({
+                        "source": "WeWorkRemotely (Contract)",
+                        "title": title,
+                        "company": (
+                            title.split(":")[0].strip() if ":" in title else "WWR Client"
+                        ),
+                        "url": link,
+                        "date": "",
+                        "matches": matched,
+                        "description": desc[:1500],
+                    })
+    except Exception as e:
+        print(f"[-] WWR error: {e}")
+
+    print(f"[*] WeWorkRemotely kontrak valid: {len(jobs)} listing")
     return jobs
 
 
 def generate_with_fallback(
-    client, prompt: str, temperature: float = 0.3, retries_per_model: int = 3, initial_delay: int = 4
+    client,
+    prompt: str,
+    temperature: float = 0.3,
+    retries_per_model: int = 3,
+    initial_delay: int = 4,
 ) -> str:
     """Memanggil Gemini API dengan fallback model aktif otomatis."""
     candidate_models = []
@@ -430,7 +454,10 @@ def generate_with_fallback(
                     return response.text.strip()
             except Exception as e:
                 err_msg = str(e)
-                if any(k in err_msg.lower() for k in ["not found", "404", "deprecated", "limit: 0", "unsupported"]):
+                if any(
+                    k in err_msg.lower()
+                    for k in ["not found", "404", "deprecated", "limit: 0", "unsupported"]
+                ):
                     break
                 time.sleep((initial_delay * attempt) + random.uniform(1.0, 2.5))
 
@@ -440,7 +467,7 @@ def generate_with_fallback(
 def agent_solutions_architect(client, job: dict) -> str:
     """Karyawan 2 (Solutions Architect): Meracik 3-poin micro-audit & cold pitch B2B."""
     prompt = f"""
-You are Riyan Khamdani, a Senior Cloud & DevOps/SRE Engineer (experienced in Kubernetes, OpenShift, Terraform, AWS/GCP, CI/CD, and AI infra).
+You are Riyan Khamdani, a Senior Cloud & DevOps/SRE Engineer (experienced in Kubernetes, OpenShift, Terraform, AWS/Azure/GCP, CI/CD, and AI infra).
 Write a sharp, direct B2B freelance/contract pitch for this opportunity:
 
 Source: {job['source']}
@@ -473,8 +500,8 @@ Drafted Pitch:
 {pitch}
 
 Scoring Criteria (1-10):
-- Give 8-10 ONLY IF: It is genuinely a contract/freelance/bounty/fractional gig (NOT a disguised full-time W2/local-only role), globally remote-friendly (open to APAC/Indonesia), strongly matches Cloud/K8s/Terraform/SRE/AI-infra skills, and the pitch sounds genuinely human and technically specific.
-- Give 1-7 IF: It looks like full-time employment, has hidden country restrictions (US/EU/UK only), is vague/low-value, or the pitch sounds generic.
+- Give 8-10 ONLY IF: It is genuinely a contract/freelance/bounty/fractional gig (NOT a disguised full-time W2/local-only role), globally remote-friendly (open to APAC/Indonesia), does NOT require the freelancer to pay out-of-pocket for AI subscriptions/API keys, strongly matches Cloud/K8s/Terraform/SRE/AI-infra skills, and the pitch sounds genuinely human and technically specific.
+- Give 1-7 IF: It looks like full-time employment, has hidden country restrictions (US/EU/UK only), requires the freelancer to pay for their own LLM subscriptions (Claude Pro/ChatGPT Plus) or API credits (BYOK), is vague/low-value, or the pitch sounds generic.
 
 Output STRICTLY valid JSON without markdown blocks:
 {{"score": 8, "reason": "Alasan singkat dalam bahasa Indonesia", "approved": true}}
@@ -496,7 +523,7 @@ def main():
     all_jobs.extend(fetch_hn_freelance_gigs())
     all_jobs.extend(fetch_remotive_contracts())
     all_jobs.extend(fetch_remoteok_contracts())
-    all_jobs.extend(fetch_ai_coding_gigs())
+    all_jobs.extend(fetch_wwr_contracts())
 
     new_jobs = [
         job for job in all_jobs if job["url"] and job["url"] not in seen_urls
