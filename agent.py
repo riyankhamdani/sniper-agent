@@ -21,11 +21,11 @@ HEADERS = {
     "Accept": "application/json, text/html;q=0.9,*/*;q=0.8",
 }
 
-# Role WAJIB di Judul / Header (Fokus ke Infra, Cloud, SRE, DevOps)
+# Role WAJIB di Judul / Paragraf Awal (Fokus ke Infra, Cloud, SRE, DevOps)
 INFRA_ROLE_REGEX = re.compile(
     r"\b(devops|sre|site reliability|platform"
     r" engineer|infrastructure|infra|kubernetes|k8s|cloud engineer|cloud"
-    r" architect|systems engineer|sysadmin|openshift|terraform|ansible)\b",
+    r" architect|systems engineer|sysadmin|openshift|terraform|ansible|mlops)\b",
     re.IGNORECASE,
 )
 
@@ -38,14 +38,29 @@ EXCLUDE_ROLES_REGEX = re.compile(
     re.IGNORECASE,
 )
 
-# Blacklist regional tertutup (US, UK, EU, Canada, India, dll)
+# Blacklist regional tertutup
 GEO_EXCLUDE_REGEX = re.compile(
-    r"(?:remote\s*[-–(:]\s*(?:us|usa|u\.s\.|uk|eu|europe|canada|india|latam|americas|uk\s+or\s+eu|eu\s+or\s+uk)[^)\n]*\)?|"
+    r"(?:remote\s*[-–(:]\s*(?:us|usa|u\.s\.|uk|eu|europe|canada|india|latam|americas)\s*[)\],]|"
     r"\b(?:us|usa|uk|eu|canada|india)\s+only\b|"
     r"\b(?:us|usa|uk|eu)\s+citizens?\b|"
     r"\bw2\s+only\b|"
     r"\bsecurity\s+clearance\b|"
-    r"\bbased\s+in\s+(?:the\s+)?(?:us|usa|uk|eu|europe)\b)",
+    r"\b(?:must\s+(?:be\s+located|reside)\s+in|applicants?\s+(?:must\s+be\s+)?based\s+in)\s+(?:the\s+)?(?:us|usa|uk|eu|europe|canada)\b)",
+    re.IGNORECASE,
+)
+
+# Blacklist komitmen berat / tabrakan jam kerja full-time
+HEAVY_COMMITMENT_REGEX = re.compile(
+    r"(?:\b(?:35|40)\s*(?:hrs?|hours?)\s*(?:/|per)\s*week\b|"
+    r"\bfull[\s-]?time\s+(?:hours|availability|commitment|schedule)\b|"
+    r"\b(?:must|required\s+to)\s+overlap\s+with\s+(?:us|est|pst|cst|mst|cet|uk)\b|"
+    r"\b(?:us|est|pst|cet)\s+business\s+hours\b)",
+    re.IGNORECASE,
+)
+
+# Prioritas tinggi untuk side-gig async / fleksibel
+ASYNC_PRIORITY_REGEX = re.compile(
+    r"\b(async|asynchronous|part[\s-]?time|fractional|advisory|project[\s-]?based|retainer|bounty|flexible\s+hours|weekend)\b",
     re.IGNORECASE,
 )
 
@@ -93,10 +108,13 @@ PROFILE_KEYWORDS = {
     ],
 }
 
-# Pola deteksi proyek lepas / kontrak / fractional / hourly
+# Pola deteksi proyek lepas / kontrak / fractional / B2B / konsultan
 CONTRACT_REGEX = re.compile(
-    r"(?<!smart\s)(?<!federal\s)(?<!government\s)\b(contract|contractor|freelance|freelancer|b2b|c2c|hourly|retainer|part-time|part"
-    r" time|fractional|1099|project-based|short-term)\b",
+    r"(?<!smart\s)(?<!federal\s)(?<!government\s)\b("
+    r"contract|contractor|freelance|freelancer|b2b|c2c|corp[\s-]to[\s-]corp|"
+    r"hourly|retainer|part[\s-]time|fractional|1099|project[\s-]based|"
+    r"short[\s-]term|consultant|consulting|outside\s+ir35|independent\s+contractor"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -117,14 +135,14 @@ def save_seen_urls(seen_urls: set):
         json.dump(urls_to_save, f, indent=2)
 
 
-def send_telegram_message(text: str):
+def send_telegram_message(text: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("[!] TELEGRAM_BOT_TOKEN atau TELEGRAM_CHAT_ID belum diset.")
-        return
+        return False
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = "https" + "://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN.strip() + "/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": TELEGRAM_CHAT_ID.strip(),
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
@@ -135,9 +153,11 @@ def send_telegram_message(text: str):
             print(f"[!] Gagal kirim HTML ({resp.text[:100]}), fallback teks biasa...")
             payload.pop("parse_mode")
             payload["text"] = re.sub(r"<[^>]+>", "", text)
-            requests.post(url, json=payload, timeout=15)
+            resp = requests.post(url, json=payload, timeout=15)
+        return resp.status_code == 200
     except Exception as e:
         print(f"[!] Error Telegram API: {e}")
+        return False
 
 
 def extract_matched_skills(text: str) -> list:
@@ -152,28 +172,27 @@ def extract_matched_skills(text: str) -> list:
 def is_valid_gig(
     header_or_title: str, full_text: str, is_freelance_board: bool = False
 ) -> bool:
-    combined_head = f"{header_or_title} {full_text[:400]}"
+    combined_head = f"{header_or_title} {full_text[:1000]}"
 
+    # Tolak full-time kecuali ada penegasan opsi part-time / fractional / project-based
     if re.search(
         r"\b(full[\s-]time|permanent\s+role|w2\s+employee)\b",
         combined_head,
         re.IGNORECASE,
     ):
-        if not re.search(
-            r"\b(contract|freelance|b2b|part[\s-]time|fractional)\b",
-            combined_head,
-            re.IGNORECASE,
-        ):
+        if not ASYNC_PRIORITY_REGEX.search(combined_head):
             return False
 
-    if GEO_EXCLUDE_REGEX.search(combined_head) or GEO_EXCLUDE_REGEX.search(
+    # Tolak kontrak yang menuntut 35-40 jam/minggu atau wajib overlap jam kerja Barat
+    if HEAVY_COMMITMENT_REGEX.search(combined_head) or HEAVY_COMMITMENT_REGEX.search(
         full_text
     ):
         return False
 
-    if BYOK_EXCLUDE_REGEX.search(combined_head) or BYOK_EXCLUDE_REGEX.search(
-        full_text
-    ):
+    if GEO_EXCLUDE_REGEX.search(combined_head) or GEO_EXCLUDE_REGEX.search(full_text):
+        return False
+
+    if BYOK_EXCLUDE_REGEX.search(combined_head) or BYOK_EXCLUDE_REGEX.search(full_text):
         return False
 
     if EXCLUDE_ROLES_REGEX.search(header_or_title):
@@ -194,7 +213,7 @@ def fetch_hn_freelance_gigs() -> list:
     """Karyawan 1 (Scout): Scan thread 'Seeking Freelancer' & kontrak di Hacker News."""
     jobs = []
     try:
-        url = "https://hn.algolia.com/api/v1/search_by_date?tags=story,author_whoishiring&hitsPerPage=12"
+        url = "https" + "://hn.algolia.com/api/v1/search_by_date?tags=story,author_whoishiring&hitsPerPage=12"
         res = requests.get(url, headers=HEADERS, timeout=15).json()
         hits = res.get("hits", [])
 
@@ -212,10 +231,10 @@ def fetch_hn_freelance_gigs() -> list:
 
             query_str = (
                 "devops OR kubernetes OR terraform OR sre OR infrastructure OR aws OR"
-                " azure OR cloud"
+                " azure OR cloud OR openshift"
             )
             comments_url = (
-                f"https://hn.algolia.com/api/v1/search"
+                "https" + "://hn.algolia.com/api/v1/search_by_date"
                 f"?tags=comment,story_{story_id}"
                 f"&query={requests.utils.quote(query_str)}"
                 f"&hitsPerPage=500"
@@ -225,6 +244,9 @@ def fetch_hn_freelance_gigs() -> list:
             ).json()
 
             for hit in comments_res.get("hits", []):
+                if str(hit.get("parent_id")) != str(story_id):
+                    continue
+
                 raw_html = hit.get("comment_text", "")
                 text = html.unescape(raw_html)
                 text_with_newlines = re.sub(r"</?p>", "\n", text)
@@ -237,7 +259,7 @@ def fetch_hn_freelance_gigs() -> list:
                 lines = [
                     line.strip() for line in clean_text.splitlines() if line.strip()
                 ]
-                first_line = lines[0] if lines else clean_text[:140]
+                first_line = lines[0] if lines else clean_text[:160]
 
                 if "ONSITE" in first_line.upper() and "REMOTE" not in first_line.upper():
                     continue
@@ -257,7 +279,7 @@ def fetch_hn_freelance_gigs() -> list:
                             "source": tag_label,
                             "title": snippet,
                             "company": hit.get("author", "HN Client"),
-                            "url": f"https://news.ycombinator.com/item?id={hit.get('objectID')}",
+                            "url": "https" + f"://news.ycombinator.com/item?id={hit.get('objectID')}",
                             "date": hit.get("created_at", "")[:10],
                             "matches": matched_skills,
                             "description": clean_text[:1500],
@@ -270,62 +292,74 @@ def fetch_hn_freelance_gigs() -> list:
 
 
 def fetch_remotive_contracts() -> list:
-    """Karyawan 1 (Scout): Proyek kontrak/freelance DevOps & Sysadmin dari Remotive."""
+    """Karyawan 1 (Scout): Proyek kontrak/B2B DevOps & Software dari Remotive."""
     jobs = []
-    try:
-        url = "https://remotive.com/api/remote-jobs?category=devops&limit=50"
-        res = requests.get(url, headers=HEADERS, timeout=15).json()
-        for item in res.get("jobs", []):
-            job_type = str(item.get("job_type") or "").lower()
-            title = str(item.get("title") or "").strip()
-            desc = re.sub(r"<[^>]+>", " ", str(item.get("description") or ""))
-            geo = str(item.get("candidate_required_location") or "").lower()
+    categories = ["devops", "software-dev"]
+    seen_ids = set()
 
-            if job_type not in ["contract", "freelance", "part_time"]:
-                continue
+    for cat in categories:
+        try:
+            url = "https" + f"://remotive.com/api/remote-jobs?category={cat}&limit=60"
+            res = requests.get(url, headers=HEADERS, timeout=15).json()
+            for item in res.get("jobs", []):
+                job_id = item.get("id")
+                if job_id in seen_ids:
+                    continue
+                seen_ids.add(job_id)
 
-            if geo and not any(
-                term in geo
-                for term in [
-                    "worldwide",
-                    "anywhere",
-                    "global",
-                    "apac",
-                    "asia",
-                    "indonesia",
-                ]
-            ):
-                continue
+                job_type = str(item.get("job_type") or "").lower()
+                title = str(item.get("title") or "").strip()
+                desc = re.sub(r"<[^>]+>", " ", str(item.get("description") or ""))
+                geo = str(item.get("candidate_required_location") or "").lower()
 
-            header_meta = f"{title} | {geo} | {job_type}"
-            if is_valid_gig(header_meta, desc, is_freelance_board=True):
-                matched = extract_matched_skills(f"{title} {desc}")
-                if matched:
-                    jobs.append({
-                        "source": f"Remotive ({job_type.title()})",
-                        "title": title,
-                        "company": str(item.get("company_name") or "Client").strip(),
-                        "url": str(item.get("url") or ""),
-                        "date": str(item.get("publication_date") or "")[:10],
-                        "matches": matched,
-                        "description": desc[:1500],
-                    })
-    except Exception as e:
-        print(f"[-] Remotive error: {e}")
+                is_explicit_contract_type = job_type in ["contract", "freelance", "part_time"]
+
+                if geo and not any(
+                    term in geo
+                    for term in [
+                        "worldwide",
+                        "anywhere",
+                        "global",
+                        "apac",
+                        "asia",
+                        "indonesia",
+                        "utc",
+                        "gmt",
+                    ]
+                ):
+                    continue
+
+                header_meta = f"{title} | {geo} | {job_type}"
+                if is_valid_gig(
+                    header_meta, desc, is_freelance_board=is_explicit_contract_type
+                ):
+                    matched = extract_matched_skills(f"{title} {desc}")
+                    if matched:
+                        jobs.append({
+                            "source": f"Remotive ({job_type.title() or 'Contract'})",
+                            "title": title,
+                            "company": str(item.get("company_name") or "Client").strip(),
+                            "url": str(item.get("url") or ""),
+                            "date": str(item.get("publication_date") or "")[:10],
+                            "matches": matched,
+                            "description": desc[:1500],
+                        })
+        except Exception as e:
+            print(f"[-] Remotive ({cat}) error: {e}")
 
     print(f"[*] Remotive kontrak/freelance valid: {len(jobs)} listing")
     return jobs
 
 
 def fetch_remoteok_contracts() -> list:
-    """Karyawan 1 (Scout): Listing kontrak/freelance dari RemoteOK API."""
+    """Karyawan 1 (Scout): Listing kontrak/freelance dari feed utama RemoteOK API."""
     jobs = []
     try:
-        url = "https://remoteok.com/api?tag=devops"
+        url = "https" + "://remoteok.com/api"
         res = requests.get(url, headers=HEADERS, timeout=15).json()
         listings = res[1:] if isinstance(res, list) and len(res) > 1 else []
 
-        for item in listings[:60]:
+        for item in listings[:100]:
             title = str(item.get("position") or "").strip()
             tags = " ".join(str(t) for t in item.get("tags", [])).lower()
             desc = re.sub(r"<[^>]+>", " ", str(item.get("description") or ""))
@@ -333,7 +367,14 @@ def fetch_remoteok_contracts() -> list:
 
             if location and not any(
                 term in location
-                for term in ["worldwide", "anywhere", "global", "remote", "apac"]
+                for term in [
+                    "worldwide",
+                    "anywhere",
+                    "global",
+                    "remote",
+                    "apac",
+                    "asia",
+                ]
             ):
                 continue
 
@@ -347,7 +388,7 @@ def fetch_remoteok_contracts() -> list:
                         "company": str(item.get("company") or "Client").strip(),
                         "url": str(
                             item.get("url")
-                            or f"https://remoteok.com/remote-jobs/{item.get('id')}"
+                            or ("https" + f"://remoteok.com/remote-jobs/{item.get('id')}")
                         ),
                         "date": str(item.get("date") or "")[:10],
                         "matches": matched,
@@ -361,51 +402,152 @@ def fetch_remoteok_contracts() -> list:
 
 
 def fetch_wwr_contracts() -> list:
-    """Karyawan 1 (Scout): Kontrak DevOps/Sysadmin dari RSS WeWorkRemotely."""
+    """Karyawan 1 (Scout): Kontrak DevOps & Programming dari RSS WeWorkRemotely."""
+    jobs = []
+    feeds = [
+        "https" + "://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss",
+        "https" + "://weworkremotely.com/categories/remote-programming-jobs.rss",
+    ]
+    seen_links = set()
+
+    for url in feeds:
+        try:
+            res = requests.get(url, headers=HEADERS, timeout=15)
+            items = re.findall(r"<item>(.*?)</item>", res.text, re.DOTALL)
+
+            for raw_item in items[:40]:
+                title_m = re.search(r"<title><!\[CDATA\[(.*?)\]\]></title>", raw_item)
+                link_m = re.search(r"<link>(.*?)</link>", raw_item)
+                desc_m = re.search(
+                    r"<description><!\[CDATA\[(.*?)\]\]></description>",
+                    raw_item,
+                    re.DOTALL,
+                )
+                region_m = re.search(r"<region>(.*?)</region>", raw_item)
+
+                title = html.unescape(title_m.group(1)).strip() if title_m else ""
+                link = link_m.group(1).strip() if link_m else ""
+                if not link or link in seen_links:
+                    continue
+                seen_links.add(link)
+
+                desc = (
+                    re.sub(r"<[^>]+>", " ", html.unescape(desc_m.group(1)))
+                    if desc_m
+                    else ""
+                )
+                region = region_m.group(1).strip().lower() if region_m else ""
+
+                header_meta = f"{title} | {region}"
+                if is_valid_gig(header_meta, desc, is_freelance_board=False):
+                    matched = extract_matched_skills(f"{title} {desc}")
+                    if matched:
+                        jobs.append({
+                            "source": "WeWorkRemotely (Contract)",
+                            "title": title,
+                            "company": (
+                                title.split(":")[0].strip() if ":" in title else "WWR Client"
+                            ),
+                            "url": link,
+                            "date": "",
+                            "matches": matched,
+                            "description": desc[:1500],
+                        })
+        except Exception as e:
+            print(f"[-] WWR error: {e}")
+
+    print(f"[*] WeWorkRemotely kontrak valid: {len(jobs)} listing")
+    return jobs
+
+
+def fetch_jobicy_contracts() -> list:
+    """Karyawan 1 (Scout): Listing kontrak/freelance DevOps dari Jobicy API."""
     jobs = []
     try:
-        url = "https://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss"
-        res = requests.get(url, headers=HEADERS, timeout=15)
-        items = re.findall(r"<item>(.*?)</item>", res.text, re.DOTALL)
-
-        for raw_item in items[:30]:
-            title_m = re.search(r"<title><!\[CDATA\[(.*?)\]\]></title>", raw_item)
-            link_m = re.search(r"<link>(.*?)</link>", raw_item)
-            desc_m = re.search(
-                r"<description><!\[CDATA\[(.*?)\]\]></description>",
-                raw_item,
-                re.DOTALL,
+        url = "https" + "://jobicy.com/api/v2/remote-jobs?count=50&tag=devops"
+        res = requests.get(url, headers=HEADERS, timeout=15).json()
+        for item in res.get("jobs", []):
+            title = str(item.get("jobTitle") or "").strip()
+            job_type = (
+                " ".join(item.get("jobType", [])).lower()
+                if isinstance(item.get("jobType"), list)
+                else str(item.get("jobType") or "").lower()
             )
-            region_m = re.search(r"<region>(.*?)</region>", raw_item)
-
-            title = html.unescape(title_m.group(1)).strip() if title_m else ""
-            link = link_m.group(1).strip() if link_m else ""
-            desc = (
-                re.sub(r"<[^>]+>", " ", html.unescape(desc_m.group(1)))
-                if desc_m
-                else ""
+            geo = str(item.get("jobGeo") or "").lower()
+            desc = re.sub(
+                r"<[^>]+>",
+                " ",
+                str(item.get("jobDescription") or item.get("jobExcerpt") or ""),
             )
-            region = region_m.group(1).strip().lower() if region_m else ""
 
-            header_meta = f"{title} | {region}"
-            if is_valid_gig(header_meta, desc, is_freelance_board=False):
+            if geo and not any(
+                term in geo
+                for term in ["anywhere", "worldwide", "global", "apac", "asia"]
+            ):
+                continue
+
+            is_contract_type = any(
+                t in job_type for t in ["contract", "freelance", "part-time"]
+            )
+            header_meta = f"{title} | {geo} | {job_type}"
+            if is_valid_gig(header_meta, desc, is_freelance_board=is_contract_type):
                 matched = extract_matched_skills(f"{title} {desc}")
                 if matched:
                     jobs.append({
-                        "source": "WeWorkRemotely (Contract)",
+                        "source": "Jobicy (Contract)",
                         "title": title,
-                        "company": (
-                            title.split(":")[0].strip() if ":" in title else "WWR Client"
-                        ),
-                        "url": link,
-                        "date": "",
+                        "company": str(item.get("companyName") or "Client").strip(),
+                        "url": str(item.get("url") or ""),
+                        "date": str(item.get("pubDate") or "")[:10],
                         "matches": matched,
                         "description": desc[:1500],
                     })
     except Exception as e:
-        print(f"[-] WWR error: {e}")
+        print(f"[-] Jobicy error: {e}")
 
-    print(f"[*] WeWorkRemotely kontrak valid: {len(jobs)} listing")
+    print(f"[*] Jobicy kontrak/freelance valid: {len(jobs)} listing")
+    return jobs
+
+
+def fetch_workingnomads_contracts() -> list:
+    """Karyawan 1 (Scout): Listing kontrak DevOps dari Working Nomads API."""
+    jobs = []
+    try:
+        url = "https" + "://www.workingnomads.com/api/exposed_jobs/"
+        res = requests.get(url, headers=HEADERS, timeout=15).json()
+        for item in res[:150]:
+            cat = str(item.get("category_name") or "").lower()
+            if "devops" not in cat and "system" not in cat and "development" not in cat:
+                continue
+
+            title = str(item.get("title") or "").strip()
+            tags = str(item.get("tags") or "").lower()
+            location = str(item.get("location") or "").lower()
+            desc = re.sub(r"<[^>]+>", " ", str(item.get("description") or ""))
+
+            if location and not any(
+                term in location
+                for term in ["anywhere", "worldwide", "global", "apac", "asia", "remote"]
+            ):
+                continue
+
+            header_meta = f"{title} | {location} | {tags}"
+            if is_valid_gig(header_meta, desc, is_freelance_board=False):
+                matched = extract_matched_skills(f"{title} {tags} {desc}")
+                if matched:
+                    jobs.append({
+                        "source": "WorkingNomads (Contract)",
+                        "title": title,
+                        "company": str(item.get("company_name") or "Client").strip(),
+                        "url": str(item.get("url") or ""),
+                        "date": str(item.get("pub_date") or "")[:10],
+                        "matches": matched,
+                        "description": desc[:1500],
+                    })
+    except Exception as e:
+        print(f"[-] WorkingNomads error: {e}")
+
+    print(f"[*] WorkingNomads kontrak valid: {len(jobs)} listing")
     return jobs
 
 
@@ -416,28 +558,22 @@ def generate_with_fallback(
     retries_per_model: int = 3,
     initial_delay: int = 4,
 ) -> str:
-    """Memanggil Gemini API dengan fallback model aktif otomatis."""
-    candidate_models = []
+    """Memanggil Gemini API dengan prioritas model aktif terbaru."""
+    preferred = [
+        "gemini-3.8-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+    ]
+    candidate_models = list(preferred)
+
     try:
         active_models = [m.name.replace("models/", "") for m in client.models.list()]
-        preferred = [
-            "gemini-2.5-flash",
-            "gemini-2.0-flash",
-            "gemini-1.5-flash",
-            "gemini-2.5-flash-lite",
-            "gemini-2.5-pro",
-        ]
-        for pref in preferred:
-            if pref in active_models:
-                candidate_models.append(pref)
         for m in active_models:
             if "gemini" in m and "embedding" not in m and m not in candidate_models:
                 candidate_models.append(m)
     except Exception:
         pass
-
-    if not candidate_models:
-        candidate_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 
     config = types.GenerateContentConfig(
         temperature=temperature,
@@ -465,10 +601,10 @@ def generate_with_fallback(
 
 
 def agent_solutions_architect(client, job: dict) -> str:
-    """Karyawan 2 (Solutions Architect): Meracik 3-poin micro-audit & cold pitch B2B."""
+    """Karyawan 2 (Solutions Architect): Meracik pitch async / side-gig B2B tanpa ganggu full-time."""
     prompt = f"""
 You are Riyan Khamdani, a Senior Cloud & DevOps/SRE Engineer (experienced in Kubernetes, OpenShift, Terraform, AWS/Azure/GCP, CI/CD, and AI infra).
-Write a sharp, direct B2B freelance/contract pitch for this opportunity:
+Write a sharp, direct B2B async/fractional freelance pitch for this opportunity:
 
 Source: {job['source']}
 Client/Company: {job['company']}
@@ -480,19 +616,21 @@ Details:
 Rules:
 1. NO robotic AI fluff (strictly avoid "Dear hiring manager", "I hope this finds you well", "I am excited to apply", "thrilled").
 2. Keep it under 95 words in natural, confident English.
-3. Include 3 concrete technical "micro-audit / execution" bullets tailored specifically to their stack or pain points mentioned in the details.
-4. End with a low-friction call to action (e.g., offering a quick 15-min architecture sync or async audit).
-5. Output ONLY the pitch text, nothing else.
+3. Explicitly frame your availability as an **async, milestone-based, or fractional specialist (10–15 hrs/week)** so expectations are clear from day one.
+4. Include 3 concrete technical "micro-audit / execution" bullets tailored specifically to their stack or pain points mentioned in the details.
+5. End with a low-friction async call to action (e.g., offering a quick async architecture audit or brief sync).
+6. Output ONLY the pitch text, nothing else.
 """
     return generate_with_fallback(client, prompt, temperature=0.4)
 
 
 def agent_quality_control(client, job: dict, pitch: str) -> dict:
-    """Karyawan 3 (QC Gatekeeper): Menilai kelayakan proyek & kualitas pitch (skor 1-10)."""
+    """Karyawan 3 (QC Gatekeeper): Menilai kelayakan side-gig agar tidak mengganggu full-time."""
     prompt = f"""
-You are a strict QC Manager for a Senior Cloud/DevOps Freelance Sniper pipeline.
-Evaluate this gig and the drafted pitch:
+You are a strict QC Manager for a Senior Cloud/DevOps Side-Gig Sniper pipeline.
+The candidate currently holds a daytime full-time Cloud Engineer role (GMT+7 / Jakarta) and ONLY wants safe, non-conflicting side gigs.
 
+Evaluate this gig and the drafted pitch:
 Title: {job['title']}
 Source: {job['source']}
 Details: {job.get('description', '')[:800]}
@@ -500,11 +638,18 @@ Drafted Pitch:
 {pitch}
 
 Scoring Criteria (1-10):
-- Give 8-10 ONLY IF: It is genuinely a contract/freelance/bounty/fractional gig (NOT a disguised full-time W2/local-only role), globally remote-friendly (open to APAC/Indonesia), does NOT require the freelancer to pay out-of-pocket for AI subscriptions/API keys, strongly matches Cloud/K8s/Terraform/SRE/AI-infra skills, and the pitch sounds genuinely human and technically specific.
-- Give 1-7 IF: It looks like full-time employment, has hidden country restrictions (US/EU/UK only), requires the freelancer to pay for their own LLM subscriptions (Claude Pro/ChatGPT Plus) or API credits (BYOK), is vague/low-value, or the pitch sounds generic.
+- Give 8-10 ONLY IF:
+  1) It can be executed as a genuine side-gig (part-time, fractional, project-based, bounty, or async contract <= 15-20 hrs/week) WITHOUT interfering with a daytime full-time job.
+  2) Globally remote-friendly (open to APAC/Indonesia, no mandatory 9-to-5 US/EU synchronous meetings).
+  3) Does NOT require the freelancer to pay out-of-pocket for AI subscriptions/API keys (no BYOK).
+  4) Strongly matches Cloud/K8s/Terraform/SRE/AI-infra skills, and the pitch is specific and human.
+- Give 1-7 IF:
+  1) It is a disguised full-time role (35-40 hrs/week) or demands rigid synchronous overlap during daytime/late-night GMT+7.
+  2) Has hidden country restrictions (US/EU/UK only) or requires BYOK paid subscriptions.
+  3) Vague/low-value or generic pitch.
 
 Output STRICTLY valid JSON without markdown blocks:
-{{"score": 8, "reason": "Alasan singkat dalam bahasa Indonesia", "approved": true}}
+{{"score": 8, "reason": "Alasan singkat dalam bahasa Indonesia (sebutkan estimasi fleksibilitas waktunya)", "approved": true}}
 """
     try:
         raw_res = generate_with_fallback(client, prompt, temperature=0.1)
@@ -524,34 +669,50 @@ def main():
     all_jobs.extend(fetch_remotive_contracts())
     all_jobs.extend(fetch_remoteok_contracts())
     all_jobs.extend(fetch_wwr_contracts())
+    all_jobs.extend(fetch_jobicy_contracts())
+    all_jobs.extend(fetch_workingnomads_contracts())
 
-    new_jobs = [
-        job for job in all_jobs if job["url"] and job["url"] not in seen_urls
-    ]
-    print(
-        f"[*] Total lolos kurasi awal: {len(all_jobs)}, listing baru: {len(new_jobs)}"
+    # Deduplikasi URL lintas sumber
+    unique_new_jobs = []
+    batch_urls = set()
+    for job in all_jobs:
+        u = job.get("url", "")
+        if u and u not in seen_urls and u not in batch_urls:
+            batch_urls.add(u)
+            unique_new_jobs.append(job)
+
+    # Prioritaskan proyek yang eksplisit menyebut async / part-time / project-based / advisory
+    unique_new_jobs.sort(
+        key=lambda j: bool(
+            ASYNC_PRIORITY_REGEX.search(f"{j['title']} {j.get('description', '')}")
+        ),
+        reverse=True,
     )
 
-    if not new_jobs:
-        print("[!] Tidak ada proyek freelance/side-gig baru hari ini. Bot standby.")
+    print(
+        f"[*] Total lolos kurasi awal: {len(all_jobs)}, listing baru: {len(unique_new_jobs)}"
+    )
+
+    if not unique_new_jobs:
+        print("[!] Tidak ada proyek side-gig aman hari ini. Bot standby.")
         return
 
-    # Batasi evaluasi AI maks 5 kandidat teratas per run agar hemat kuota & cepat
-    candidates = new_jobs[:5]
-    for job in candidates:
-        seen_urls.add(job["url"])
+    candidates = unique_new_jobs[:5]
 
     if not GEMINI_API_KEY:
         print("[!] GEMINI_API_KEY belum diset. Mengirim mode radar standar...")
-        message = "<b>⚡ FREELANCE SNIPER RADAR (NO-AI FALLBACK)</b>\n====================================\n\n"
+        message = "<b>⚡ SIDE-GIG SNIPER RADAR (NO-AI FALLBACK)</b>\n====================================\n\n"
         for idx, job in enumerate(candidates, 1):
             message += f"<b>{idx}. {html.escape(job['title'])}</b>\n🔗 <a href='{job['url']}'>Apply</a>\n\n"
-        send_telegram_message(message)
-        save_seen_urls(seen_urls)
+        if send_telegram_message(message):
+            for job in candidates:
+                seen_urls.add(job["url"])
+            save_seen_urls(seen_urls)
         return
 
     client = genai.Client(api_key=GEMINI_API_KEY)
     approved_gigs = []
+    evaluated_urls = set()
 
     for job in candidates:
         print(f"[*] AI memproses: {job['title'][:60]}...")
@@ -561,6 +722,7 @@ def main():
             score = qc.get("score", 0)
             reason = qc.get("reason", "-")
             print(f"    -> QC Skor: {score}/10 | {reason}")
+            evaluated_urls.add(job["url"])
 
             if score >= 8 and qc.get("approved", False):
                 job["ai_pitch"] = pitch
@@ -568,19 +730,19 @@ def main():
                 job["qc_reason"] = reason
                 approved_gigs.append(job)
 
-            time.sleep(2)  # Jeda aman untuk free-tier RPM
+            time.sleep(2)
         except Exception as e:
             print(f"[-] Gagal memproses kandidat via AI: {e}")
 
-    save_seen_urls(seen_urls)
-
     if not approved_gigs:
-        print("🛑 Tidak ada prospek yang lolos QC (skor >= 8) hari ini. Telegram tidak di-spam.")
+        seen_urls.update(evaluated_urls)
+        save_seen_urls(seen_urls)
+        print("🛑 Tidak ada prospek side-gig yang lolos QC (skor >= 8) hari ini. Telegram tidak di-spam.")
         return
 
     message = (
-        "<b>🎯 FREELANCE SNIPER BRIEFING (QC APPROVED)</b>\n"
-        "<i>Hanya prospek skor ≥ 8 lengkap dengan Micro-Audit Pitch siap copas</i>\n"
+        "<b>🎯 ASYNC SIDE-GIG BRIEFING (QC APPROVED)</b>\n"
+        "<i>Aman untuk full-time • Skor ≥ 8 • Pitch siap copas</i>\n"
         "====================================\n\n"
     )
 
@@ -591,13 +753,17 @@ def main():
             f"🏢 <b>Client:</b> {html.escape(job['company'])} | <b>Via:</b> {html.escape(job['source'])}\n"
             f"🎯 <b>Stack:</b> <code>{html.escape(tags_formatted)}</code>\n"
             f"🛡️ <b>QC Note:</b> <i>{html.escape(job['qc_reason'])}</i>\n\n"
-            f"📋 <b>Cold Pitch Siap Copas:</b>\n"
+            f"📋 <b>Async Pitch Siap Copas:</b>\n"
             f"<blockquote>{html.escape(job['ai_pitch'])}</blockquote>\n"
             f"🔗 <a href='{job['url']}'>Direct Apply / Contact</a>\n\n"
         )
 
-    send_telegram_message(message)
-    print(f"[✓] Berhasil mengirim {len(approved_gigs)} prospek sniper ke Telegram.")
+    if send_telegram_message(message):
+        seen_urls.update(evaluated_urls)
+        save_seen_urls(seen_urls)
+        print(f"[✓] Berhasil mengirim {len(approved_gigs)} prospek side-gig ke Telegram.")
+    else:
+        print("[!] Gagal mengirim ke Telegram; seen_urls.json tidak diperbarui agar dicoba ulang.")
 
 
 if __name__ == "__main__":
