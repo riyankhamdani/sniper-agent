@@ -74,6 +74,13 @@ BYOK_EXCLUDE_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+# Blacklist talent marketplace / agensi perantara / iklan rekrutmen massal
+AGENCY_EXCLUDE_REGEX = re.compile(
+    r"(?:\b(?:lemon\.io|toptal|turing\.com|bairesdev|andela|proxify|gun\.io|x-team|crossover|arc\.dev|usebraintrust)\b|"
+    r"utm_medium=job_ad)",
+    re.IGNORECASE,
+)
+
 # Skill mapping profil CV Riyan Khamdani
 PROFILE_KEYWORDS = {
     "OpenShift / K8s": [
@@ -170,9 +177,20 @@ def extract_matched_skills(text: str) -> list:
 
 
 def is_valid_gig(
-    header_or_title: str, full_text: str, is_freelance_board: bool = False
+    header_or_title: str,
+    full_text: str,
+    is_freelance_board: bool = False,
+    url: str = "",
 ) -> bool:
     combined_head = f"{header_or_title} {full_text[:1000]}"
+
+    # Blokir iklan talent marketplace / agensi perantara (cek URL maupun teks)
+    if (
+        AGENCY_EXCLUDE_REGEX.search(url)
+        or AGENCY_EXCLUDE_REGEX.search(combined_head)
+        or AGENCY_EXCLUDE_REGEX.search(full_text)
+    ):
+        return False
 
     # Tolak full-time kecuali ada penegasan opsi part-time / fractional / project-based
     if re.search(
@@ -264,8 +282,12 @@ def fetch_hn_freelance_gigs() -> list:
                 if "ONSITE" in first_line.upper() and "REMOTE" not in first_line.upper():
                     continue
 
+                item_url = "https" + f"://news.ycombinator.com/item?id={hit.get('objectID')}"
                 if is_valid_gig(
-                    first_line, clean_text, is_freelance_board=is_freelancer_thread
+                    first_line,
+                    clean_text,
+                    is_freelance_board=is_freelancer_thread,
+                    url=item_url,
                 ):
                     matched_skills = extract_matched_skills(clean_text)
                     if matched_skills:
@@ -279,7 +301,7 @@ def fetch_hn_freelance_gigs() -> list:
                             "source": tag_label,
                             "title": snippet,
                             "company": hit.get("author", "HN Client"),
-                            "url": "https" + f"://news.ycombinator.com/item?id={hit.get('objectID')}",
+                            "url": item_url,
                             "date": hit.get("created_at", "")[:10],
                             "matches": matched_skills,
                             "description": clean_text[:1500],
@@ -311,6 +333,7 @@ def fetch_remotive_contracts() -> list:
                 title = str(item.get("title") or "").strip()
                 desc = re.sub(r"<[^>]+>", " ", str(item.get("description") or ""))
                 geo = str(item.get("candidate_required_location") or "").lower()
+                item_url = str(item.get("url") or "")
 
                 is_explicit_contract_type = job_type in ["contract", "freelance", "part_time"]
 
@@ -331,7 +354,10 @@ def fetch_remotive_contracts() -> list:
 
                 header_meta = f"{title} | {geo} | {job_type}"
                 if is_valid_gig(
-                    header_meta, desc, is_freelance_board=is_explicit_contract_type
+                    header_meta,
+                    desc,
+                    is_freelance_board=is_explicit_contract_type,
+                    url=item_url,
                 ):
                     matched = extract_matched_skills(f"{title} {desc}")
                     if matched:
@@ -339,7 +365,7 @@ def fetch_remotive_contracts() -> list:
                             "source": f"Remotive ({job_type.title() or 'Contract'})",
                             "title": title,
                             "company": str(item.get("company_name") or "Client").strip(),
-                            "url": str(item.get("url") or ""),
+                            "url": item_url,
                             "date": str(item.get("publication_date") or "")[:10],
                             "matches": matched,
                             "description": desc[:1500],
@@ -364,6 +390,10 @@ def fetch_remoteok_contracts() -> list:
             tags = " ".join(str(t) for t in item.get("tags", [])).lower()
             desc = re.sub(r"<[^>]+>", " ", str(item.get("description") or ""))
             location = str(item.get("location") or "").lower()
+            item_url = str(
+                item.get("url")
+                or ("https" + f"://remoteok.com/remote-jobs/{item.get('id')}")
+            )
 
             if location and not any(
                 term in location
@@ -379,17 +409,16 @@ def fetch_remoteok_contracts() -> list:
                 continue
 
             header_meta = f"{title} | {location} | {tags}"
-            if is_valid_gig(header_meta, desc, is_freelance_board=False):
+            if is_valid_gig(
+                header_meta, desc, is_freelance_board=False, url=item_url
+            ):
                 matched = extract_matched_skills(f"{title} {tags} {desc}")
                 if matched:
                     jobs.append({
                         "source": "RemoteOK (Contract)",
                         "title": title,
                         "company": str(item.get("company") or "Client").strip(),
-                        "url": str(
-                            item.get("url")
-                            or ("https" + f"://remoteok.com/remote-jobs/{item.get('id')}")
-                        ),
+                        "url": item_url,
                         "date": str(item.get("date") or "")[:10],
                         "matches": matched,
                         "description": desc[:1500],
@@ -439,7 +468,9 @@ def fetch_wwr_contracts() -> list:
                 region = region_m.group(1).strip().lower() if region_m else ""
 
                 header_meta = f"{title} | {region}"
-                if is_valid_gig(header_meta, desc, is_freelance_board=False):
+                if is_valid_gig(
+                    header_meta, desc, is_freelance_board=False, url=link
+                ):
                     matched = extract_matched_skills(f"{title} {desc}")
                     if matched:
                         jobs.append({
@@ -479,6 +510,7 @@ def fetch_jobicy_contracts() -> list:
                 " ",
                 str(item.get("jobDescription") or item.get("jobExcerpt") or ""),
             )
+            item_url = str(item.get("url") or "")
 
             if geo and not any(
                 term in geo
@@ -490,14 +522,19 @@ def fetch_jobicy_contracts() -> list:
                 t in job_type for t in ["contract", "freelance", "part-time"]
             )
             header_meta = f"{title} | {geo} | {job_type}"
-            if is_valid_gig(header_meta, desc, is_freelance_board=is_contract_type):
+            if is_valid_gig(
+                header_meta,
+                desc,
+                is_freelance_board=is_contract_type,
+                url=item_url,
+            ):
                 matched = extract_matched_skills(f"{title} {desc}")
                 if matched:
                     jobs.append({
                         "source": "Jobicy (Contract)",
                         "title": title,
                         "company": str(item.get("companyName") or "Client").strip(),
-                        "url": str(item.get("url") or ""),
+                        "url": item_url,
                         "date": str(item.get("pubDate") or "")[:10],
                         "matches": matched,
                         "description": desc[:1500],
@@ -524,6 +561,7 @@ def fetch_workingnomads_contracts() -> list:
             tags = str(item.get("tags") or "").lower()
             location = str(item.get("location") or "").lower()
             desc = re.sub(r"<[^>]+>", " ", str(item.get("description") or ""))
+            item_url = str(item.get("url") or "")
 
             if location and not any(
                 term in location
@@ -532,14 +570,16 @@ def fetch_workingnomads_contracts() -> list:
                 continue
 
             header_meta = f"{title} | {location} | {tags}"
-            if is_valid_gig(header_meta, desc, is_freelance_board=False):
+            if is_valid_gig(
+                header_meta, desc, is_freelance_board=False, url=item_url
+            ):
                 matched = extract_matched_skills(f"{title} {tags} {desc}")
                 if matched:
                     jobs.append({
                         "source": "WorkingNomads (Contract)",
                         "title": title,
                         "company": str(item.get("company_name") or "Client").strip(),
-                        "url": str(item.get("url") or ""),
+                        "url": item_url,
                         "date": str(item.get("pub_date") or "")[:10],
                         "matches": matched,
                         "description": desc[:1500],
@@ -628,23 +668,24 @@ def agent_quality_control(client, job: dict, pitch: str) -> dict:
     """Karyawan 3 (QC Gatekeeper): Menilai kelayakan side-gig agar tidak mengganggu full-time."""
     prompt = f"""
 You are a strict QC Manager for a Senior Cloud/DevOps Side-Gig Sniper pipeline.
-The candidate currently holds a daytime full-time Cloud Engineer role (GMT+7 / Jakarta) and ONLY wants safe, non-conflicting side gigs.
+The candidate currently holds a daytime full-time Cloud Engineer role (GMT+7 / Jakarta) and ONLY wants safe, non-conflicting side gigs with direct clients (NOT talent agencies/marketplaces).
 
 Evaluate this gig and the drafted pitch:
 Title: {job['title']}
 Source: {job['source']}
+URL: {job['url']}
 Details: {job.get('description', '')[:800]}
 Drafted Pitch:
 {pitch}
 
 Scoring Criteria (1-10):
 - Give 8-10 ONLY IF:
-  1) It can be executed as a genuine side-gig (part-time, fractional, project-based, bounty, or async contract <= 15-20 hrs/week) WITHOUT interfering with a daytime full-time job.
+  1) It is a direct client side-gig (part-time, fractional, project-based, bounty, or async contract <= 15-20 hrs/week) WITHOUT interfering with a daytime full-time job.
   2) Globally remote-friendly (open to APAC/Indonesia, no mandatory 9-to-5 US/EU synchronous meetings).
   3) Does NOT require the freelancer to pay out-of-pocket for AI subscriptions/API keys (no BYOK).
   4) Strongly matches Cloud/K8s/Terraform/SRE/AI-infra skills, and the pitch is specific and human.
 - Give 1-7 IF:
-  1) It is a disguised full-time role (35-40 hrs/week) or demands rigid synchronous overlap during daytime/late-night GMT+7.
+  1) It is a disguised full-time role (35-40 hrs/week), a talent agency/marketplace ad, or demands rigid synchronous overlap during daytime/late-night GMT+7.
   2) Has hidden country restrictions (US/EU/UK only) or requires BYOK paid subscriptions.
   3) Vague/low-value or generic pitch.
 
