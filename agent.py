@@ -4,6 +4,7 @@ import os
 import random
 import re
 import time
+import xml.etree.ElementTree as ET
 import requests
 from google import genai
 from google.genai import types
@@ -231,53 +232,146 @@ def is_valid_gig(
 
 
 def fetch_reddit_hiring_gigs() -> list:
-    """Scout Utama 1: Postingan [Hiring] langsung dari klien di subreddit freelance & devops."""
+    """Scout Utama 1: Postingan [Hiring] dari Reddit (OAuth API -> Fallback RSS per subreddit)."""
     jobs = []
-    reddit_headers = {
-        "User-Agent": "python:sidegig-infra-radar:v1.1 (by /u/riyan_infra_bot)"
+    subreddits = ["forhire", "freelance_forhire", "devopsjobs"]
+    user_agent = "python:sidegig-infra-radar:v1.2 (by /u/riyan_infra_bot)"
+
+    client_id = os.getenv("REDDIT_CLIENT_ID", "").strip()
+    client_secret = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
+
+    # JALUR 1: Reddit Official OAuth (kebal blokir IP cloud / GitHub Actions)
+    if client_id and client_secret:
+        try:
+            auth_resp = requests.post(
+                "https://www.reddit.com/api/v1/access_token",
+                auth=(client_id, client_secret),
+                data={"grant_type": "client_credentials"},
+                headers={"User-Agent": user_agent},
+                timeout=15,
+            )
+            auth_resp.raise_for_status()
+            token = auth_resp.json().get("access_token")
+
+            oauth_headers = {
+                "Authorization": f"Bearer {token}",
+                "User-Agent": user_agent,
+            }
+            url = f"https://oauth.reddit.com/r/{'+'.join(subreddits)}/new?limit=75"
+            resp = requests.get(url, headers=oauth_headers, timeout=15)
+            resp.raise_for_status()
+
+            for child in resp.json().get("data", {}).get("children", []):
+                post = child.get("data", {})
+                title = str(post.get("title") or "").strip()
+                flair = str(post.get("link_flair_text") or "").lower()
+                body = str(post.get("selftext") or "").strip()
+
+                if "[hiring]" not in title.lower() and "hiring" not in flair:
+                    continue
+                if "[for hire]" in title.lower():
+                    continue
+
+                item_url = f"https://www.reddit.com{post.get('permalink', '')}"
+                subreddit = post.get("subreddit", "")
+                is_freelance_sub = subreddit.lower() in ["forhire", "freelance_forhire"]
+
+                if is_valid_gig(
+                    title, body, is_freelance_board=is_freelance_sub, url=item_url
+                ):
+                    matched = extract_matched_skills(f"{title} {body}")
+                    if matched:
+                        jobs.append({
+                            "source": f"Reddit r/{subreddit}",
+                            "title": title,
+                            "company": f"u/{post.get('author', 'client')}",
+                            "url": item_url,
+                            "date": time.strftime(
+                                "%Y-%m-%d", time.gmtime(post.get("created_utc", 0))
+                            ),
+                            "matches": matched,
+                            "description": body[:1500] or title,
+                        })
+
+            print(f"[*] Reddit [Hiring] (OAuth) valid: {len(jobs)} listing")
+            return jobs
+        except Exception as e:
+            print(f"[!] Reddit OAuth gagal ({e}), beralih ke mode RSS...")
+
+    # JALUR 2: Fallback RSS per subreddit (tanpa kredensial API)
+    rss_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) "
+            "Gecko/20100101 Firefox/132.0"
+        ),
+        "Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9",
     }
-    url = "https://www.reddit.com/r/forhire+freelance_forhire+devopsjobs/new.json?limit=75"
+    ns = {"atom": "http://www.w3.org/2005/Atom"}
 
-    try:
-        resp = requests.get(url, headers=reddit_headers, timeout=15)
-        resp.raise_for_status()
-        res = resp.json()
+    for sub in subreddits:
+        try:
+            rss_url = f"https://www.reddit.com/r/{sub}/new/.rss?limit=40"
+            resp = requests.get(rss_url, headers=rss_headers, timeout=15)
+            resp.raise_for_status()
 
-        for child in res.get("data", {}).get("children", []):
-            post = child.get("data", {})
-            title = str(post.get("title") or "").strip()
-            flair = str(post.get("link_flair_text") or "").lower()
-            body = str(post.get("selftext") or "").strip()
+            root = ET.fromstring(resp.text)
+            is_freelance_sub = sub.lower() in ["forhire", "freelance_forhire"]
 
-            if "[hiring]" not in title.lower() and "hiring" not in flair:
-                continue
-            if "[for hire]" in title.lower():
-                continue
+            for entry in root.findall("atom:entry", ns):
+                title_el = entry.find("atom:title", ns)
+                link_el = entry.find("atom:link", ns)
+                content_el = entry.find("atom:content", ns)
+                author_el = entry.find("atom:author/atom:name", ns)
+                updated_el = entry.find("atom:updated", ns)
 
-            item_url = f"https://www.reddit.com{post.get('permalink', '')}"
-            subreddit = post.get("subreddit", "")
-            is_freelance_sub = subreddit.lower() in ["forhire", "freelance_forhire"]
+                title = (
+                    html.unescape(title_el.text or "").strip()
+                    if title_el is not None
+                    else ""
+                )
+                if "[hiring]" not in title.lower() or "[for hire]" in title.lower():
+                    continue
 
-            if is_valid_gig(
-                title, body, is_freelance_board=is_freelance_sub, url=item_url
-            ):
-                matched = extract_matched_skills(f"{title} {body}")
-                if matched:
-                    jobs.append({
-                        "source": f"Reddit r/{subreddit}",
-                        "title": title,
-                        "company": f"u/{post.get('author', 'client')}",
-                        "url": item_url,
-                        "date": time.strftime(
-                            "%Y-%m-%d", time.gmtime(post.get("created_utc", 0))
-                        ),
-                        "matches": matched,
-                        "description": body[:1500] or title,
-                    })
-    except Exception as e:
-        print(f"[-] Reddit error: {e}")
+                item_url = (
+                    link_el.attrib.get("href", "").strip()
+                    if link_el is not None
+                    else ""
+                )
+                raw_html = (
+                    html.unescape(content_el.text or "")
+                    if content_el is not None
+                    else ""
+                )
+                body = html.unescape(re.sub(r"<[^>]+>", " ", raw_html)).strip()
+                author = (
+                    (author_el.text or "client").replace("/u/", "").strip()
+                    if author_el is not None
+                    else "client"
+                )
+                date_str = (
+                    (updated_el.text or "")[:10] if updated_el is not None else ""
+                )
 
-    print(f"[*] Reddit [Hiring] valid: {len(jobs)} listing")
+                if is_valid_gig(
+                    title, body, is_freelance_board=is_freelance_sub, url=item_url
+                ):
+                    matched = extract_matched_skills(f"{title} {body}")
+                    if matched:
+                        jobs.append({
+                            "source": f"Reddit r/{sub}",
+                            "title": title,
+                            "company": f"u/{author}",
+                            "url": item_url,
+                            "date": date_str,
+                            "matches": matched,
+                            "description": body[:1500] or title,
+                        })
+
+            time.sleep(1.5)
+        except Exception as e:
+            print(f"[-] Reddit RSS (r/{sub}) error: {e}")
+
+    print(f"[*] Reddit [Hiring] (RSS) valid: {len(jobs)} listing")
     return jobs
 
 
@@ -727,8 +821,6 @@ def generate_with_fallback(
 ) -> str:
     """Memanggil Gemini API dengan prioritas model aktif terbaru."""
     preferred = [
-        "gemini-3.8-flash",
-        "gemini-3.5-flash-lite",
         "gemini-2.5-flash",
         "gemini-2.5-flash-lite",
     ]
