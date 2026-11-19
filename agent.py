@@ -147,7 +147,7 @@ def send_telegram_message(text: str) -> bool:
         print("[!] TELEGRAM_BOT_TOKEN atau TELEGRAM_CHAT_ID belum diset.")
         return False
 
-    url = "https" + "://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN.strip() + "/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN.strip()}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID.strip(),
         "text": text,
@@ -184,7 +184,7 @@ def is_valid_gig(
 ) -> bool:
     combined_head = f"{header_or_title} {full_text[:1000]}"
 
-    # Blokir iklan talent marketplace / agensi perantara (cek URL maupun teks)
+    # Blokir iklan talent marketplace / agensi perantara
     if (
         AGENCY_EXCLUDE_REGEX.search(url)
         or AGENCY_EXCLUDE_REGEX.search(combined_head)
@@ -192,13 +192,16 @@ def is_valid_gig(
     ):
         return False
 
-    # Tolak full-time kecuali ada penegasan opsi part-time / fractional / project-based
+    # Tolak full-time kecuali ada penegasan kontrak / freelance / part-time / async
     if re.search(
         r"\b(full[\s-]time|permanent\s+role|w2\s+employee)\b",
         combined_head,
         re.IGNORECASE,
     ):
-        if not ASYNC_PRIORITY_REGEX.search(combined_head):
+        if not (
+            ASYNC_PRIORITY_REGEX.search(combined_head)
+            or CONTRACT_REGEX.search(combined_head)
+        ):
             return False
 
     # Tolak kontrak yang menuntut 35-40 jam/minggu atau wajib overlap jam kerja Barat
@@ -227,13 +230,121 @@ def is_valid_gig(
     return True
 
 
-def fetch_hn_freelance_gigs() -> list:
-    """Karyawan 1 (Scout): Scan thread 'Seeking Freelancer' & kontrak di Hacker News."""
+def fetch_reddit_hiring_gigs() -> list:
+    """Scout Utama 1: Postingan [Hiring] langsung dari klien di subreddit freelance & devops."""
+    jobs = []
+    reddit_headers = {
+        "User-Agent": "python:sidegig-infra-radar:v1.1 (by /u/riyan_infra_bot)"
+    }
+    url = "https://www.reddit.com/r/forhire+freelance_forhire+devopsjobs/new.json?limit=75"
+
+    try:
+        resp = requests.get(url, headers=reddit_headers, timeout=15)
+        resp.raise_for_status()
+        res = resp.json()
+
+        for child in res.get("data", {}).get("children", []):
+            post = child.get("data", {})
+            title = str(post.get("title") or "").strip()
+            flair = str(post.get("link_flair_text") or "").lower()
+            body = str(post.get("selftext") or "").strip()
+
+            if "[hiring]" not in title.lower() and "hiring" not in flair:
+                continue
+            if "[for hire]" in title.lower():
+                continue
+
+            item_url = f"https://www.reddit.com{post.get('permalink', '')}"
+            subreddit = post.get("subreddit", "")
+            is_freelance_sub = subreddit.lower() in ["forhire", "freelance_forhire"]
+
+            if is_valid_gig(
+                title, body, is_freelance_board=is_freelance_sub, url=item_url
+            ):
+                matched = extract_matched_skills(f"{title} {body}")
+                if matched:
+                    jobs.append({
+                        "source": f"Reddit r/{subreddit}",
+                        "title": title,
+                        "company": f"u/{post.get('author', 'client')}",
+                        "url": item_url,
+                        "date": time.strftime(
+                            "%Y-%m-%d", time.gmtime(post.get("created_utc", 0))
+                        ),
+                        "matches": matched,
+                        "description": body[:1500] or title,
+                    })
+    except Exception as e:
+        print(f"[-] Reddit error: {e}")
+
+    print(f"[*] Reddit [Hiring] valid: {len(jobs)} listing")
+    return jobs
+
+
+def fetch_himalayas_contracts() -> list:
+    """Scout Utama 2: Proyek Part-Time / Contractor / Freelance dari Himalayas API."""
     jobs = []
     try:
-        url = "https" + "://hn.algolia.com/api/v1/search_by_date?tags=story,author_whoishiring&hitsPerPage=12"
-        res = requests.get(url, headers=HEADERS, timeout=15).json()
-        hits = res.get("hits", [])
+        url = "https://himalayas.app/jobs/api?limit=50"
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        res = resp.json()
+
+        for item in res.get("jobs", []):
+            emp_type = str(item.get("employmentType") or "").lower()
+            if not any(
+                k in emp_type for k in ["part", "contract", "freelance", "temp"]
+            ):
+                continue
+
+            restrictions = item.get("locationRestrictions") or []
+            if restrictions and not any(
+                any(
+                    ok in str(loc).lower()
+                    for ok in ["worldwide", "anywhere", "asia", "apac", "indonesia"]
+                )
+                for loc in restrictions
+            ):
+                continue
+
+            title = str(item.get("title") or "").strip()
+            desc = re.sub(
+                r"<[^>]+>",
+                " ",
+                str(item.get("description") or item.get("excerpt") or ""),
+            )
+            item_url = str(item.get("applicationLink") or item.get("guid") or "")
+            header_meta = f"{title} | {emp_type}"
+
+            if is_valid_gig(
+                header_meta, desc, is_freelance_board=True, url=item_url
+            ):
+                matched = extract_matched_skills(f"{title} {desc}")
+                if matched:
+                    jobs.append({
+                        "source": f"Himalayas ({item.get('employmentType')})",
+                        "title": title,
+                        "company": str(item.get("companyName") or "Client").strip(),
+                        "url": item_url,
+                        "date": str(item.get("pubDate") or "")[:10],
+                        "matches": matched,
+                        "description": desc[:1500],
+                    })
+    except Exception as e:
+        print(f"[-] Himalayas error: {e}")
+
+    print(f"[*] Himalayas kontrak/part-time valid: {len(jobs)} listing")
+    return jobs
+
+
+def fetch_hn_freelance_gigs() -> list:
+    """Scout 3: Scan thread 'Seeking Freelancer' & kontrak di Hacker News."""
+    jobs = []
+    try:
+        url = "https://hn.algolia.com/api/v1/search_by_date?tags=story,author_whoishiring&hitsPerPage=12"
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        hits = resp.json().get("hits", [])
 
         target_stories = [
             h
@@ -252,16 +363,15 @@ def fetch_hn_freelance_gigs() -> list:
                 " azure OR cloud OR openshift"
             )
             comments_url = (
-                "https" + "://hn.algolia.com/api/v1/search_by_date"
+                "https://hn.algolia.com/api/v1/search_by_date"
                 f"?tags=comment,story_{story_id}"
                 f"&query={requests.utils.quote(query_str)}"
                 f"&hitsPerPage=500"
             )
-            comments_res = requests.get(
-                comments_url, headers=HEADERS, timeout=15
-            ).json()
+            c_resp = requests.get(comments_url, headers=HEADERS, timeout=15)
+            c_resp.raise_for_status()
 
-            for hit in comments_res.get("hits", []):
+            for hit in c_resp.json().get("hits", []):
                 if str(hit.get("parent_id")) != str(story_id):
                     continue
 
@@ -282,7 +392,7 @@ def fetch_hn_freelance_gigs() -> list:
                 if "ONSITE" in first_line.upper() and "REMOTE" not in first_line.upper():
                     continue
 
-                item_url = "https" + f"://news.ycombinator.com/item?id={hit.get('objectID')}"
+                item_url = f"https://news.ycombinator.com/item?id={hit.get('objectID')}"
                 if is_valid_gig(
                     first_line,
                     clean_text,
@@ -314,16 +424,18 @@ def fetch_hn_freelance_gigs() -> list:
 
 
 def fetch_remotive_contracts() -> list:
-    """Karyawan 1 (Scout): Proyek kontrak/B2B DevOps & Software dari Remotive."""
+    """Scout 4: Proyek kontrak/B2B DevOps & Software dari Remotive."""
     jobs = []
     categories = ["devops", "software-dev"]
     seen_ids = set()
 
     for cat in categories:
         try:
-            url = "https" + f"://remotive.com/api/remote-jobs?category={cat}&limit=60"
-            res = requests.get(url, headers=HEADERS, timeout=15).json()
-            for item in res.get("jobs", []):
+            url = f"https://remotive.com/api/remote-jobs?category={cat}&limit=60"
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+            resp.raise_for_status()
+
+            for item in resp.json().get("jobs", []):
                 job_id = item.get("id")
                 if job_id in seen_ids:
                     continue
@@ -335,7 +447,11 @@ def fetch_remotive_contracts() -> list:
                 geo = str(item.get("candidate_required_location") or "").lower()
                 item_url = str(item.get("url") or "")
 
-                is_explicit_contract_type = job_type in ["contract", "freelance", "part_time"]
+                is_explicit_contract_type = job_type in [
+                    "contract",
+                    "freelance",
+                    "part_time",
+                ]
 
                 if geo and not any(
                     term in geo
@@ -378,11 +494,13 @@ def fetch_remotive_contracts() -> list:
 
 
 def fetch_remoteok_contracts() -> list:
-    """Karyawan 1 (Scout): Listing kontrak/freelance dari feed utama RemoteOK API."""
+    """Scout 5: Listing kontrak/freelance dari feed utama RemoteOK API."""
     jobs = []
     try:
-        url = "https" + "://remoteok.com/api"
-        res = requests.get(url, headers=HEADERS, timeout=15).json()
+        url = "https://remoteok.com/api"
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        res = resp.json()
         listings = res[1:] if isinstance(res, list) and len(res) > 1 else []
 
         for item in listings[:100]:
@@ -392,7 +510,7 @@ def fetch_remoteok_contracts() -> list:
             location = str(item.get("location") or "").lower()
             item_url = str(
                 item.get("url")
-                or ("https" + f"://remoteok.com/remote-jobs/{item.get('id')}")
+                or f"https://remoteok.com/remote-jobs/{item.get('id')}"
             )
 
             if location and not any(
@@ -431,24 +549,29 @@ def fetch_remoteok_contracts() -> list:
 
 
 def fetch_wwr_contracts() -> list:
-    """Karyawan 1 (Scout): Kontrak DevOps & Programming dari RSS WeWorkRemotely."""
+    """Scout 6: Kontrak DevOps & Programming dari RSS WeWorkRemotely."""
     jobs = []
     feeds = [
-        "https" + "://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss",
-        "https" + "://weworkremotely.com/categories/remote-programming-jobs.rss",
+        "https://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss",
+        "https://weworkremotely.com/categories/remote-programming-jobs.rss",
     ]
     seen_links = set()
 
     for url in feeds:
         try:
             res = requests.get(url, headers=HEADERS, timeout=15)
+            res.raise_for_status()
             items = re.findall(r"<item>(.*?)</item>", res.text, re.DOTALL)
 
             for raw_item in items[:40]:
-                title_m = re.search(r"<title><!\[CDATA\[(.*?)\]\]></title>", raw_item)
+                title_m = re.search(
+                    r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>",
+                    raw_item,
+                    re.DOTALL,
+                )
                 link_m = re.search(r"<link>(.*?)</link>", raw_item)
                 desc_m = re.search(
-                    r"<description><!\[CDATA\[(.*?)\]\]></description>",
+                    r"<description>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</description>",
                     raw_item,
                     re.DOTALL,
                 )
@@ -492,12 +615,14 @@ def fetch_wwr_contracts() -> list:
 
 
 def fetch_jobicy_contracts() -> list:
-    """Karyawan 1 (Scout): Listing kontrak/freelance DevOps dari Jobicy API."""
+    """Scout 7: Listing kontrak/freelance DevOps dari Jobicy API."""
     jobs = []
     try:
-        url = "https" + "://jobicy.com/api/v2/remote-jobs?count=50&tag=devops"
-        res = requests.get(url, headers=HEADERS, timeout=15).json()
-        for item in res.get("jobs", []):
+        url = "https://jobicy.com/api/v2/remote-jobs?count=50&tag=devops"
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+
+        for item in resp.json().get("jobs", []):
             title = str(item.get("jobTitle") or "").strip()
             job_type = (
                 " ".join(item.get("jobType", [])).lower()
@@ -547,12 +672,14 @@ def fetch_jobicy_contracts() -> list:
 
 
 def fetch_workingnomads_contracts() -> list:
-    """Karyawan 1 (Scout): Listing kontrak DevOps dari Working Nomads API."""
+    """Scout 8: Listing kontrak DevOps dari Working Nomads API."""
     jobs = []
     try:
-        url = "https" + "://www.workingnomads.com/api/exposed_jobs/"
-        res = requests.get(url, headers=HEADERS, timeout=15).json()
-        for item in res[:150]:
+        url = "https://www.workingnomads.com/api/exposed_jobs/"
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+
+        for item in resp.json()[:150]:
             cat = str(item.get("category_name") or "").lower()
             if "devops" not in cat and "system" not in cat and "development" not in cat:
                 continue
@@ -706,6 +833,10 @@ def main():
     print(f"[*] Total history seen URLs: {len(seen_urls)}")
 
     all_jobs = []
+    # Sumber prioritas tinggi khusus freelance & kontrak pendek
+    all_jobs.extend(fetch_reddit_hiring_gigs())
+    all_jobs.extend(fetch_himalayas_contracts())
+    # Sumber sekunder (HN bulanan & job boards)
     all_jobs.extend(fetch_hn_freelance_gigs())
     all_jobs.extend(fetch_remotive_contracts())
     all_jobs.extend(fetch_remoteok_contracts())
