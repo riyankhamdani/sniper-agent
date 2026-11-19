@@ -232,10 +232,15 @@ def is_valid_gig(
 
 
 def fetch_reddit_hiring_gigs() -> list:
-    """Scout Utama 1: Postingan [Hiring] Reddit tanpa API key (PullPush -> Arctic Shift -> old.reddit RSS)."""
+    """Scout Utama 1: Postingan [Hiring] Reddit tanpa API key (Arctic Shift -> PullPush -> Google News RSS)."""
     jobs = []
     subreddits = ["forhire", "freelance_forhire", "devopsjobs"]
     seen_post_urls = set()
+
+    mirror_headers = {
+        "User-Agent": "SideGigRadar/1.4 (personal-job-scanner; non-commercial)",
+        "Accept": "application/json",
+    }
 
     def _process_post(
         sub: str, title: str, body: str, author: str, item_url: str, created_ts: int
@@ -267,14 +272,15 @@ def fetch_reddit_hiring_gigs() -> list:
 
     for sub in subreddits:
         fetched = False
+        errors = []
 
-        # JALUR 1: PullPush Public API (tanpa auth, tembus blokir IP ISP/Cloud)
+        # JALUR 1: Arctic Shift API (ambil 50 post terbaru langsung tanpa full-text query)
         try:
-            pp_url = (
-                "https://api.pullpush.io/reddit/search/submission/"
-                f"?subreddit={sub}&q=hiring&size=50&sort=desc&sort_type=created_utc"
+            as_url = (
+                "https://arctic-shift.photon-reddit.com/api/posts/search"
+                f"?subreddit={sub}&limit=50&sort=desc"
             )
-            resp = requests.get(pp_url, headers=HEADERS, timeout=15)
+            resp = requests.get(as_url, headers=mirror_headers, timeout=15)
             resp.raise_for_status()
             for post in resp.json().get("data", []):
                 title = html.unescape(str(post.get("title") or "")).strip()
@@ -294,17 +300,17 @@ def fetch_reddit_hiring_gigs() -> list:
                 created_ts = int(float(post.get("created_utc") or 0))
                 _process_post(sub, title, body, author, item_url, created_ts)
             fetched = True
-        except Exception:
-            pass
+        except Exception as e:
+            errors.append(f"ArcticShift: {e}")
 
-        # JALUR 2: Fallback Arctic Shift Public API (tanpa auth)
+        # JALUR 2: PullPush API
         if not fetched:
             try:
-                as_url = (
-                    "https://arctic-shift.photon-reddit.com/api/posts/search"
-                    f"?subreddit={sub}&title=hiring&limit=50&sort=desc"
+                pp_url = (
+                    "https://api.pullpush.io/reddit/search/submission/"
+                    f"?subreddit={sub}&size=50"
                 )
-                resp = requests.get(as_url, headers=HEADERS, timeout=15)
+                resp = requests.get(pp_url, headers=mirror_headers, timeout=15)
                 resp.raise_for_status()
                 for post in resp.json().get("data", []):
                     title = html.unescape(str(post.get("title") or "")).strip()
@@ -324,52 +330,40 @@ def fetch_reddit_hiring_gigs() -> list:
                     created_ts = int(float(post.get("created_utc") or 0))
                     _process_post(sub, title, body, author, item_url, created_ts)
                 fetched = True
-            except Exception:
-                pass
+            except Exception as e:
+                errors.append(f"PullPush: {e}")
 
-        # JALUR 3: Fallback terakhir via old.reddit RSS
+        # JALUR 3: Google News RSS Indexer (kebal blokir IP cloud / GitHub Actions)
         if not fetched:
             try:
-                rss_url = f"https://old.reddit.com/r/{sub}/new.rss?limit=40"
-                rss_headers = {
-                    "User-Agent": f"SideGigRadar/1.3-{random.randint(100,999)}",
-                    "Accept": "application/atom+xml, application/xml;q=0.9",
-                }
-                resp = requests.get(rss_url, headers=rss_headers, timeout=15)
+                gnews_url = (
+                    "https://news.google.com/rss/search"
+                    f"?q=site:reddit.com/r/{sub}+%22hiring%22+when:3d&hl=en-US&gl=US&ceid=US:en"
+                )
+                resp = requests.get(gnews_url, headers=HEADERS, timeout=15)
                 resp.raise_for_status()
-                ns = {"atom": "http://www.w3.org/2005/Atom"}
                 root = ET.fromstring(resp.text)
 
-                for entry in root.findall("atom:entry", ns):
-                    title_el = entry.find("atom:title", ns)
-                    link_el = entry.find("atom:link", ns)
-                    content_el = entry.find("atom:content", ns)
-                    author_el = entry.find("atom:author/atom:name", ns)
-
-                    title = (
-                        html.unescape(title_el.text or "").strip()
-                        if title_el is not None
-                        else ""
+                for item in root.findall(".//item"):
+                    raw_title = html.unescape(item.findtext("title") or "").strip()
+                    title = re.sub(r"\s*-\s*Reddit$", "", raw_title).strip()
+                    raw_desc = html.unescape(item.findtext("description") or "")
+                    link_match = re.search(
+                        r'href="(https://www\.reddit\.com/r/[^"]+)"', raw_desc
                     )
                     item_url = (
-                        link_el.attrib.get("href", "").strip()
-                        if link_el is not None
-                        else ""
+                        link_match.group(1)
+                        if link_match
+                        else (item.findtext("link") or "").strip()
                     )
-                    raw_html = (
-                        html.unescape(content_el.text or "")
-                        if content_el is not None
-                        else ""
-                    )
-                    body = html.unescape(re.sub(r"<[^>]+>", " ", raw_html)).strip()
-                    author = (
-                        (author_el.text or "client").replace("/u/", "").strip()
-                        if author_el is not None
-                        else "client"
-                    )
-                    _process_post(sub, title, body, author, item_url, 0)
+                    body = re.sub(r"<[^>]+>", " ", raw_desc).strip()
+                    _process_post(sub, title, body, "reddit_client", item_url, 0)
+                fetched = True
             except Exception as e:
-                print(f"[-] Semua jalur Reddit (r/{sub}) gagal: {e}")
+                errors.append(f"GNews: {e}")
+
+        if not fetched:
+            print(f"[-] Semua jalur Reddit (r/{sub}) gagal -> {' | '.join(errors)}")
 
         time.sleep(1.0)
 
