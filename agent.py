@@ -232,146 +232,148 @@ def is_valid_gig(
 
 
 def fetch_reddit_hiring_gigs() -> list:
-    """Scout Utama 1: Postingan [Hiring] dari Reddit (OAuth API -> Fallback RSS per subreddit)."""
+    """Scout Utama 1: Postingan [Hiring] Reddit tanpa API key (PullPush -> Arctic Shift -> old.reddit RSS)."""
     jobs = []
     subreddits = ["forhire", "freelance_forhire", "devopsjobs"]
-    user_agent = "python:sidegig-infra-radar:v1.2 (by /u/riyan_infra_bot)"
+    seen_post_urls = set()
 
-    client_id = os.getenv("REDDIT_CLIENT_ID", "").strip()
-    client_secret = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
+    def _process_post(
+        sub: str, title: str, body: str, author: str, item_url: str, created_ts: int
+    ):
+        if not item_url or item_url in seen_post_urls:
+            return
+        if "[hiring]" not in title.lower() or "[for hire]" in title.lower():
+            return
 
-    # JALUR 1: Reddit Official OAuth (kebal blokir IP cloud / GitHub Actions)
-    if client_id and client_secret:
-        try:
-            auth_resp = requests.post(
-                "https://www.reddit.com/api/v1/access_token",
-                auth=(client_id, client_secret),
-                data={"grant_type": "client_credentials"},
-                headers={"User-Agent": user_agent},
-                timeout=15,
-            )
-            auth_resp.raise_for_status()
-            token = auth_resp.json().get("access_token")
-
-            oauth_headers = {
-                "Authorization": f"Bearer {token}",
-                "User-Agent": user_agent,
-            }
-            url = f"https://oauth.reddit.com/r/{'+'.join(subreddits)}/new?limit=75"
-            resp = requests.get(url, headers=oauth_headers, timeout=15)
-            resp.raise_for_status()
-
-            for child in resp.json().get("data", {}).get("children", []):
-                post = child.get("data", {})
-                title = str(post.get("title") or "").strip()
-                flair = str(post.get("link_flair_text") or "").lower()
-                body = str(post.get("selftext") or "").strip()
-
-                if "[hiring]" not in title.lower() and "hiring" not in flair:
-                    continue
-                if "[for hire]" in title.lower():
-                    continue
-
-                item_url = f"https://www.reddit.com{post.get('permalink', '')}"
-                subreddit = post.get("subreddit", "")
-                is_freelance_sub = subreddit.lower() in ["forhire", "freelance_forhire"]
-
-                if is_valid_gig(
-                    title, body, is_freelance_board=is_freelance_sub, url=item_url
-                ):
-                    matched = extract_matched_skills(f"{title} {body}")
-                    if matched:
-                        jobs.append({
-                            "source": f"Reddit r/{subreddit}",
-                            "title": title,
-                            "company": f"u/{post.get('author', 'client')}",
-                            "url": item_url,
-                            "date": time.strftime(
-                                "%Y-%m-%d", time.gmtime(post.get("created_utc", 0))
-                            ),
-                            "matches": matched,
-                            "description": body[:1500] or title,
-                        })
-
-            print(f"[*] Reddit [Hiring] (OAuth) valid: {len(jobs)} listing")
-            return jobs
-        except Exception as e:
-            print(f"[!] Reddit OAuth gagal ({e}), beralih ke mode RSS...")
-
-    # JALUR 2: Fallback RSS per subreddit (tanpa kredensial API)
-    rss_headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) "
-            "Gecko/20100101 Firefox/132.0"
-        ),
-        "Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9",
-    }
-    ns = {"atom": "http://www.w3.org/2005/Atom"}
+        is_freelance_sub = sub.lower() in ["forhire", "freelance_forhire"]
+        if is_valid_gig(title, body, is_freelance_board=is_freelance_sub, url=item_url):
+            matched = extract_matched_skills(f"{title} {body}")
+            if matched:
+                seen_post_urls.add(item_url)
+                date_str = (
+                    time.strftime("%Y-%m-%d", time.gmtime(created_ts))
+                    if created_ts
+                    else ""
+                )
+                jobs.append({
+                    "source": f"Reddit r/{sub}",
+                    "title": title,
+                    "company": f"u/{author or 'client'}",
+                    "url": item_url,
+                    "date": date_str,
+                    "matches": matched,
+                    "description": body[:1500] or title,
+                })
 
     for sub in subreddits:
+        fetched = False
+
+        # JALUR 1: PullPush Public API (tanpa auth, tembus blokir IP ISP/Cloud)
         try:
-            rss_url = f"https://www.reddit.com/r/{sub}/new/.rss?limit=40"
-            resp = requests.get(rss_url, headers=rss_headers, timeout=15)
+            pp_url = (
+                "https://api.pullpush.io/reddit/search/submission/"
+                f"?subreddit={sub}&q=hiring&size=50&sort=desc&sort_type=created_utc"
+            )
+            resp = requests.get(pp_url, headers=HEADERS, timeout=15)
             resp.raise_for_status()
-
-            root = ET.fromstring(resp.text)
-            is_freelance_sub = sub.lower() in ["forhire", "freelance_forhire"]
-
-            for entry in root.findall("atom:entry", ns):
-                title_el = entry.find("atom:title", ns)
-                link_el = entry.find("atom:link", ns)
-                content_el = entry.find("atom:content", ns)
-                author_el = entry.find("atom:author/atom:name", ns)
-                updated_el = entry.find("atom:updated", ns)
-
-                title = (
-                    html.unescape(title_el.text or "").strip()
-                    if title_el is not None
-                    else ""
-                )
-                if "[hiring]" not in title.lower() or "[for hire]" in title.lower():
-                    continue
-
+            for post in resp.json().get("data", []):
+                title = html.unescape(str(post.get("title") or "")).strip()
+                body = html.unescape(str(post.get("selftext") or "")).strip()
+                author = str(post.get("author") or "client").strip()
+                permalink = str(post.get("permalink") or "").strip()
+                post_id = str(post.get("id") or "").strip()
                 item_url = (
-                    link_el.attrib.get("href", "").strip()
-                    if link_el is not None
-                    else ""
+                    f"https://www.reddit.com{permalink}"
+                    if permalink.startswith("/")
+                    else (
+                        f"https://www.reddit.com/r/{sub}/comments/{post_id}/"
+                        if post_id
+                        else ""
+                    )
                 )
-                raw_html = (
-                    html.unescape(content_el.text or "")
-                    if content_el is not None
-                    else ""
-                )
-                body = html.unescape(re.sub(r"<[^>]+>", " ", raw_html)).strip()
-                author = (
-                    (author_el.text or "client").replace("/u/", "").strip()
-                    if author_el is not None
-                    else "client"
-                )
-                date_str = (
-                    (updated_el.text or "")[:10] if updated_el is not None else ""
-                )
+                created_ts = int(float(post.get("created_utc") or 0))
+                _process_post(sub, title, body, author, item_url, created_ts)
+            fetched = True
+        except Exception:
+            pass
 
-                if is_valid_gig(
-                    title, body, is_freelance_board=is_freelance_sub, url=item_url
-                ):
-                    matched = extract_matched_skills(f"{title} {body}")
-                    if matched:
-                        jobs.append({
-                            "source": f"Reddit r/{sub}",
-                            "title": title,
-                            "company": f"u/{author}",
-                            "url": item_url,
-                            "date": date_str,
-                            "matches": matched,
-                            "description": body[:1500] or title,
-                        })
+        # JALUR 2: Fallback Arctic Shift Public API (tanpa auth)
+        if not fetched:
+            try:
+                as_url = (
+                    "https://arctic-shift.photon-reddit.com/api/posts/search"
+                    f"?subreddit={sub}&title=hiring&limit=50&sort=desc"
+                )
+                resp = requests.get(as_url, headers=HEADERS, timeout=15)
+                resp.raise_for_status()
+                for post in resp.json().get("data", []):
+                    title = html.unescape(str(post.get("title") or "")).strip()
+                    body = html.unescape(str(post.get("selftext") or "")).strip()
+                    author = str(post.get("author") or "client").strip()
+                    permalink = str(post.get("permalink") or "").strip()
+                    post_id = str(post.get("id") or "").strip()
+                    item_url = (
+                        f"https://www.reddit.com{permalink}"
+                        if permalink.startswith("/")
+                        else (
+                            f"https://www.reddit.com/r/{sub}/comments/{post_id}/"
+                            if post_id
+                            else ""
+                        )
+                    )
+                    created_ts = int(float(post.get("created_utc") or 0))
+                    _process_post(sub, title, body, author, item_url, created_ts)
+                fetched = True
+            except Exception:
+                pass
 
-            time.sleep(1.5)
-        except Exception as e:
-            print(f"[-] Reddit RSS (r/{sub}) error: {e}")
+        # JALUR 3: Fallback terakhir via old.reddit RSS
+        if not fetched:
+            try:
+                rss_url = f"https://old.reddit.com/r/{sub}/new.rss?limit=40"
+                rss_headers = {
+                    "User-Agent": f"SideGigRadar/1.3-{random.randint(100,999)}",
+                    "Accept": "application/atom+xml, application/xml;q=0.9",
+                }
+                resp = requests.get(rss_url, headers=rss_headers, timeout=15)
+                resp.raise_for_status()
+                ns = {"atom": "http://www.w3.org/2005/Atom"}
+                root = ET.fromstring(resp.text)
 
-    print(f"[*] Reddit [Hiring] (RSS) valid: {len(jobs)} listing")
+                for entry in root.findall("atom:entry", ns):
+                    title_el = entry.find("atom:title", ns)
+                    link_el = entry.find("atom:link", ns)
+                    content_el = entry.find("atom:content", ns)
+                    author_el = entry.find("atom:author/atom:name", ns)
+
+                    title = (
+                        html.unescape(title_el.text or "").strip()
+                        if title_el is not None
+                        else ""
+                    )
+                    item_url = (
+                        link_el.attrib.get("href", "").strip()
+                        if link_el is not None
+                        else ""
+                    )
+                    raw_html = (
+                        html.unescape(content_el.text or "")
+                        if content_el is not None
+                        else ""
+                    )
+                    body = html.unescape(re.sub(r"<[^>]+>", " ", raw_html)).strip()
+                    author = (
+                        (author_el.text or "client").replace("/u/", "").strip()
+                        if author_el is not None
+                        else "client"
+                    )
+                    _process_post(sub, title, body, author, item_url, 0)
+            except Exception as e:
+                print(f"[-] Semua jalur Reddit (r/{sub}) gagal: {e}")
+
+        time.sleep(1.0)
+
+    print(f"[*] Reddit [Hiring] valid: {len(jobs)} listing")
     return jobs
 
 
