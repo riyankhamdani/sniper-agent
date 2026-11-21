@@ -30,18 +30,22 @@ INFRA_ROLE_REGEX = re.compile(
     re.IGNORECASE,
 )
 
-# Blacklist role non-teknis / non-infra
+# Blacklist role non-teknis, agregator link-farm, atau role client-facing berat sync
 EXCLUDE_ROLES_REGEX = re.compile(
-    r"\b(business development|sales|account"
+    r"(?:\b(?:business development|sales|account"
     r" executive|marketing|recruiter|product"
     r" manager|frontend|react|mobile|ios|android|designer|ui/ux|commission-only|equity"
-    r" only|unpaid)\b",
+    r" only|unpaid|forward deployed|solutions engineer|customer engineer|field engineer)\b|"
+    r"\b\d+\+\s+(?:devops|tech|remote)\s+jobs\b|"
+    r"\bjobs\s+that\s+opened\b)",
     re.IGNORECASE,
 )
 
-# Blacklist regional tertutup
+# Blacklist regional tertutup (termasuk tag [US] / (US) di judul)
 GEO_EXCLUDE_REGEX = re.compile(
-    r"(?:remote\s*[-–(:]\s*(?:us|usa|u\.s\.|uk|eu|europe|canada|india|latam|americas)\s*[)\],]|"
+    r"(?:\[\s*(?:us|usa|u\.s\.|uk|eu|europe|canada|india|latam|americas)\s*\]|"
+    r"\(\s*(?:us|usa|u\.s\.|uk|eu|europe|canada|india)\s*(?:only)?\s*\)|"
+    r"remote\s*[-–(:]\s*(?:us|usa|u\.s\.|uk|eu|europe|canada|india|latam|americas)\s*[)\],]|"
     r"\b(?:us|usa|uk|eu|canada|india)\s+only\b|"
     r"\b(?:us|usa|uk|eu)\s+citizens?\b|"
     r"\bw2\s+only\b|"
@@ -118,11 +122,16 @@ PROFILE_KEYWORDS = {
 
 # Pola deteksi proyek lepas / kontrak / fractional / B2B / konsultan
 CONTRACT_REGEX = re.compile(
-    r"(?<!smart\s)(?<!federal\s)(?<!government\s)\b("
+    r"(?<!smart\s)(?<!federal\s)(?<!government\s)(?<!no\s)(?<!not\s)\b("
     r"contract|contractor|freelance|freelancer|b2b|c2c|corp[\s-]to[\s-]corp|"
     r"hourly|retainer|part[\s-]time|fractional|1099|project[\s-]based|"
     r"short[\s-]term|consultant|consulting|outside\s+ir35|independent\s+contractor"
     r")\b",
+    re.IGNORECASE,
+)
+
+NO_CONTRACT_REGEX = re.compile(
+    r"\b(?:no|not\s+a)\s+(?:contract|contractors|freelance|freelancers|c2c|b2b)\b",
     re.IGNORECASE,
 )
 
@@ -224,6 +233,8 @@ def is_valid_gig(
         return False
 
     if not is_freelance_board:
+        if NO_CONTRACT_REGEX.search(full_text):
+            return False
         return bool(
             CONTRACT_REGEX.search(combined_head) or CONTRACT_REGEX.search(full_text)
         )
@@ -234,11 +245,11 @@ def is_valid_gig(
 def fetch_reddit_hiring_gigs() -> list:
     """Scout Utama 1: Postingan [Hiring] Reddit tanpa API key (Arctic Shift -> PullPush -> Google News RSS)."""
     jobs = []
-    subreddits = ["forhire", "freelance_forhire", "devopsjobs"]
+    subreddits = ["forhire", "freelance_forhire", "devopsjobs", "techjobs"]
     seen_post_urls = set()
 
     mirror_headers = {
-        "User-Agent": "SideGigRadar/1.4 (personal-job-scanner; non-commercial)",
+        "User-Agent": "SideGigRadar/1.5 (personal-job-scanner; non-commercial)",
         "Accept": "application/json",
     }
 
@@ -274,7 +285,7 @@ def fetch_reddit_hiring_gigs() -> list:
         fetched = False
         errors = []
 
-        # JALUR 1: Arctic Shift API (ambil 50 post terbaru langsung tanpa full-text query)
+        # JALUR 1: Arctic Shift API
         try:
             as_url = (
                 "https://arctic-shift.photon-reddit.com/api/posts/search"
@@ -333,7 +344,7 @@ def fetch_reddit_hiring_gigs() -> list:
             except Exception as e:
                 errors.append(f"PullPush: {e}")
 
-        # JALUR 3: Google News RSS Indexer (kebal blokir IP cloud / GitHub Actions)
+        # JALUR 3: Google News RSS Indexer
         if not fetched:
             try:
                 gnews_url = (
@@ -808,14 +819,14 @@ def fetch_workingnomads_contracts() -> list:
     return jobs
 
 
-def generate_with_fallback(
-    client,
-    prompt: str,
-    temperature: float = 0.3,
-    retries_per_model: int = 3,
-    initial_delay: int = 4,
-) -> str:
-    """Memanggil Gemini API dengan prioritas model aktif terbaru."""
+_CACHED_MODELS = None
+
+
+def get_candidate_models(client) -> list:
+    global _CACHED_MODELS
+    if _CACHED_MODELS is not None:
+        return _CACHED_MODELS
+
     preferred = [
         "gemini-2.5-flash",
         "gemini-2.5-flash-lite",
@@ -829,6 +840,20 @@ def generate_with_fallback(
                 candidate_models.append(m)
     except Exception:
         pass
+
+    _CACHED_MODELS = candidate_models
+    return _CACHED_MODELS
+
+
+def generate_with_fallback(
+    client,
+    prompt: str,
+    temperature: float = 0.3,
+    retries_per_model: int = 3,
+    initial_delay: int = 4,
+) -> str:
+    """Memanggil Gemini API dengan prioritas model aktif terbaru."""
+    candidate_models = get_candidate_models(client)
 
     config = types.GenerateContentConfig(
         temperature=temperature,
@@ -855,8 +880,43 @@ def generate_with_fallback(
     raise Exception("Seluruh kandidat model Gemini gagal merespons.")
 
 
+def agent_quality_control(client, job: dict) -> dict:
+    """Karyawan 1 (QC Gatekeeper): Menilai kelayakan side-gig lebih dulu sebelum generate pitch."""
+    prompt = f"""
+You are a strict QC Manager for a Senior Cloud/DevOps Side-Gig Sniper pipeline.
+The candidate currently holds a daytime full-time Cloud Engineer role (GMT+7 / Jakarta) and ONLY wants safe, non-conflicting side gigs with direct clients (NOT talent agencies/marketplaces/aggregators).
+
+Evaluate this gig:
+Title: {job['title']}
+Source: {job['source']}
+URL: {job['url']}
+Details: {job.get('description', '')[:1000]}
+
+Scoring Criteria (1-10):
+- Give 8-10 ONLY IF:
+  1) It is a direct client side-gig (part-time, fractional, project-based, bounty, or async contract <= 15-20 hrs/week) WITHOUT interfering with a daytime full-time job.
+  2) Globally remote-friendly (open to APAC/Indonesia, no mandatory 9-to-5 US/EU synchronous meetings).
+  3) Does NOT require the freelancer to pay out-of-pocket for AI subscriptions/API keys (no BYOK).
+  4) Strongly matches Cloud/K8s/Terraform/SRE/AI-infra skills.
+- Give 1-7 IF:
+  1) It is a disguised full-time role (35-40 hrs/week), a link-farm/aggregator post, a talent agency/marketplace ad, or demands rigid synchronous overlap during daytime/late-night GMT+7.
+  2) Has hidden country restrictions (US/EU/UK only) or requires BYOK paid subscriptions.
+  3) Vague or low-value gig.
+
+Output STRICTLY valid JSON without markdown blocks:
+{{"score": 8, "reason": "Alasan singkat dalam bahasa Indonesia (sebutkan estimasi fleksibilitas waktunya)", "approved": true}}
+"""
+    try:
+        raw_res = generate_with_fallback(client, prompt, temperature=0.1)
+        clean_json = raw_res.replace("```json", "").replace("```", "").strip()
+        return json.loads(clean_json)
+    except Exception as e:
+        print(f"[!] Warning QC parse gagal ({e}), fallback skor 7.")
+        return {"score": 7, "reason": "Fallback QC parse", "approved": False}
+
+
 def agent_solutions_architect(client, job: dict) -> str:
-    """Karyawan 2 (Solutions Architect): Meracik pitch async / side-gig B2B tanpa ganggu full-time."""
+    """Karyawan 2 (Solutions Architect): Meracik pitch async / side-gig B2B hanya untuk listing lolos QC."""
     prompt = f"""
 You are Riyan Khamdani, a Senior Cloud & DevOps/SRE Engineer (experienced in Kubernetes, OpenShift, Terraform, AWS/Azure/GCP, CI/CD, and AI infra).
 Write a sharp, direct B2B async/fractional freelance pitch for this opportunity:
@@ -877,43 +937,6 @@ Rules:
 6. Output ONLY the pitch text, nothing else.
 """
     return generate_with_fallback(client, prompt, temperature=0.4)
-
-
-def agent_quality_control(client, job: dict, pitch: str) -> dict:
-    """Karyawan 3 (QC Gatekeeper): Menilai kelayakan side-gig agar tidak mengganggu full-time."""
-    prompt = f"""
-You are a strict QC Manager for a Senior Cloud/DevOps Side-Gig Sniper pipeline.
-The candidate currently holds a daytime full-time Cloud Engineer role (GMT+7 / Jakarta) and ONLY wants safe, non-conflicting side gigs with direct clients (NOT talent agencies/marketplaces).
-
-Evaluate this gig and the drafted pitch:
-Title: {job['title']}
-Source: {job['source']}
-URL: {job['url']}
-Details: {job.get('description', '')[:800]}
-Drafted Pitch:
-{pitch}
-
-Scoring Criteria (1-10):
-- Give 8-10 ONLY IF:
-  1) It is a direct client side-gig (part-time, fractional, project-based, bounty, or async contract <= 15-20 hrs/week) WITHOUT interfering with a daytime full-time job.
-  2) Globally remote-friendly (open to APAC/Indonesia, no mandatory 9-to-5 US/EU synchronous meetings).
-  3) Does NOT require the freelancer to pay out-of-pocket for AI subscriptions/API keys (no BYOK).
-  4) Strongly matches Cloud/K8s/Terraform/SRE/AI-infra skills, and the pitch is specific and human.
-- Give 1-7 IF:
-  1) It is a disguised full-time role (35-40 hrs/week), a talent agency/marketplace ad, or demands rigid synchronous overlap during daytime/late-night GMT+7.
-  2) Has hidden country restrictions (US/EU/UK only) or requires BYOK paid subscriptions.
-  3) Vague/low-value or generic pitch.
-
-Output STRICTLY valid JSON without markdown blocks:
-{{"score": 8, "reason": "Alasan singkat dalam bahasa Indonesia (sebutkan estimasi fleksibilitas waktunya)", "approved": true}}
-"""
-    try:
-        raw_res = generate_with_fallback(client, prompt, temperature=0.1)
-        clean_json = raw_res.replace("```json", "").replace("```", "").strip()
-        return json.loads(clean_json)
-    except Exception as e:
-        print(f"[!] Warning QC parse gagal ({e}), fallback skor 7.")
-        return {"score": 7, "reason": "Fallback QC parse", "approved": False}
 
 
 def main():
@@ -975,16 +998,17 @@ def main():
     evaluated_urls = set()
 
     for job in candidates:
-        print(f"[*] AI memproses: {job['title'][:60]}...")
+        print(f"[*] AI mengevaluasi QC: {job['title'][:60]}...")
         try:
-            pitch = agent_solutions_architect(client, job)
-            qc = agent_quality_control(client, job, pitch)
+            qc = agent_quality_control(client, job)
             score = qc.get("score", 0)
             reason = qc.get("reason", "-")
             print(f"    -> QC Skor: {score}/10 | {reason}")
             evaluated_urls.add(job["url"])
 
             if score >= 8 and qc.get("approved", False):
+                print("    -> Lolos QC! Meracik async pitch...")
+                pitch = agent_solutions_architect(client, job)
                 job["ai_pitch"] = pitch
                 job["ai_score"] = score
                 job["qc_reason"] = reason
