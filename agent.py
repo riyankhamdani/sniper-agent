@@ -14,6 +14,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 STATE_FILE = "seen_urls.json"
 
+# Ambang batas skor QC minimal untuk dikirim ke Telegram (7 = bagus & realistis, 8+ = ideal)
+MIN_QC_SCORE = 7
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -22,11 +25,18 @@ HEADERS = {
     "Accept": "application/json, text/html;q=0.9,*/*;q=0.8",
 }
 
-# Role WAJIB di Judul / Paragraf Awal (Fokus ke Infra, Cloud, SRE, DevOps)
+# Diperluas: menangkap nama jabatan MAUPUN stack teknis yang dicari klien freelance
 INFRA_ROLE_REGEX = re.compile(
-    r"\b(devops|sre|site reliability|platform"
-    r" engineer|infrastructure|infra|kubernetes|k8s|cloud engineer|cloud"
-    r" architect|systems engineer|sysadmin|openshift|terraform|ansible|mlops)\b",
+    r"\b("
+    r"devops|sre|site reliability|platform engineer|infrastructure|infra|"
+    r"kubernetes|k8s|openshift|eks|gke|aks|helm|argocd|gitops|"
+    r"cloud engineer|cloud architect|cloud migration|cloud security|"
+    r"systems engineer|sysadmin|linux|ubuntu|rhel|bash|"
+    r"terraform|ansible|iac|pulumi|cloudformation|"
+    r"docker|container|ci/cd|github actions|gitlab ci|jenkins|"
+    r"aws|azure|gcp|google cloud|vmware|vsphere|mlops|ai infra|"
+    r"prometheus|grafana|observability"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -41,7 +51,7 @@ EXCLUDE_ROLES_REGEX = re.compile(
     re.IGNORECASE,
 )
 
-# Blacklist regional tertutup (termasuk tag [US] / (US) di judul)
+# Blacklist regional tertutup
 GEO_EXCLUDE_REGEX = re.compile(
     r"(?:\[\s*(?:us|usa|u\.s\.|uk|eu|europe|canada|india|latam|americas)\s*\]|"
     r"\(\s*(?:us|usa|u\.s\.|uk|eu|europe|canada|india)\s*(?:only)?\s*\)|"
@@ -65,7 +75,7 @@ HEAVY_COMMITMENT_REGEX = re.compile(
 
 # Prioritas tinggi untuk side-gig async / fleksibel
 ASYNC_PRIORITY_REGEX = re.compile(
-    r"\b(async|asynchronous|part[\s-]?time|fractional|advisory|project[\s-]?based|retainer|bounty|flexible\s+hours|weekend)\b",
+    r"\b(async|asynchronous|part[\s-]?time|fractional|advisory|project[\s-]?based|retainer|bounty|flexible\s+hours|weekend|audit|setup|migration|one[\s-]?off|quick\s+fix)\b",
     re.IGNORECASE,
 )
 
@@ -86,7 +96,7 @@ AGENCY_EXCLUDE_REGEX = re.compile(
     re.IGNORECASE,
 )
 
-# Skill mapping profil CV Riyan Khamdani
+# Skill mapping profil CV Riyan Khamdani (diperluas agar menangkap lebih banyak proyek relevan)
 PROFILE_KEYWORDS = {
     "OpenShift / K8s": [
         "openshift",
@@ -95,10 +105,22 @@ PROFILE_KEYWORDS = {
         "gke",
         "eks",
         "aks",
+        "helm",
         "podman",
         "docker",
+        "container",
     ],
-    "IaC & Automation": ["terraform", "ansible", "ci/cd", "gitops", "argocd"],
+    "IaC & Automation": [
+        "terraform",
+        "ansible",
+        "ci/cd",
+        "github actions",
+        "gitlab ci",
+        "jenkins",
+        "gitops",
+        "argocd",
+        "pulumi",
+    ],
     "Cloud & Linux": [
         "aws",
         "azure",
@@ -107,9 +129,20 @@ PROFILE_KEYWORDS = {
         "alibaba cloud",
         "rhel",
         "linux",
+        "ubuntu",
+        "nginx",
     ],
-    "Virtualization": ["vmware", "vsphere", "nsx-t", "zerto"],
-    "AI Infra & MLOps": [
+    "Virtualization & Sec": [
+        "vmware",
+        "vsphere",
+        "nsx-t",
+        "zerto",
+        "vault",
+        "iam",
+        "security",
+        "hardening",
+    ],
+    "AI Infra & Observability": [
         "ai platform",
         "dataiku",
         "mlops",
@@ -117,15 +150,18 @@ PROFILE_KEYWORDS = {
         "sre",
         "devops",
         "platform",
+        "prometheus",
+        "grafana",
     ],
 }
 
-# Pola deteksi proyek lepas / kontrak / fractional / B2B / konsultan
+# Pola deteksi proyek lepas / kontrak / fractional / B2B / konsultan / task-based
 CONTRACT_REGEX = re.compile(
     r"(?<!smart\s)(?<!federal\s)(?<!government\s)(?<!no\s)(?<!not\s)\b("
     r"contract|contractor|freelance|freelancer|b2b|c2c|corp[\s-]to[\s-]corp|"
     r"hourly|retainer|part[\s-]time|fractional|1099|project[\s-]based|"
-    r"short[\s-]term|consultant|consulting|outside\s+ir35|independent\s+contractor"
+    r"short[\s-]term|consultant|consulting|outside\s+ir35|independent\s+contractor|"
+    r"bounty|milestone|one[\s-]?off|audit|help\s+(?:with|us|me)|looking\s+for\s+(?:a|an)\s+(?:devops|cloud|k8s|kubernetes|aws|terraform)"
     r")\b",
     re.IGNORECASE,
 )
@@ -147,7 +183,7 @@ def load_seen_urls() -> set:
 
 
 def save_seen_urls(seen_urls: set):
-    urls_to_save = list(seen_urls)[-1000:]
+    urls_to_save = list(seen_urls)[-1500:]
     with open(STATE_FILE, "w") as f:
         json.dump(urls_to_save, f, indent=2)
 
@@ -194,7 +230,6 @@ def is_valid_gig(
 ) -> bool:
     combined_head = f"{header_or_title} {full_text[:1000]}"
 
-    # Blokir iklan talent marketplace / agensi perantara
     if (
         AGENCY_EXCLUDE_REGEX.search(url)
         or AGENCY_EXCLUDE_REGEX.search(combined_head)
@@ -214,7 +249,6 @@ def is_valid_gig(
         ):
             return False
 
-    # Tolak kontrak yang menuntut 35-40 jam/minggu atau wajib overlap jam kerja Barat
     if HEAVY_COMMITMENT_REGEX.search(combined_head) or HEAVY_COMMITMENT_REGEX.search(
         full_text
     ):
@@ -243,13 +277,21 @@ def is_valid_gig(
 
 
 def fetch_reddit_hiring_gigs() -> list:
-    """Scout Utama 1: Postingan [Hiring] Reddit tanpa API key (Arctic Shift -> PullPush -> Google News RSS)."""
+    """Scout 1: Postingan [Hiring] Reddit (Arctic Shift -> PullPush -> Google News RSS)."""
     jobs = []
-    subreddits = ["forhire", "freelance_forhire", "devopsjobs", "techjobs"]
+    # Diperluas ke lebih banyak subreddit aktif pencari freelancer & DevOps
+    subreddits = [
+        "forhire",
+        "freelance_forhire",
+        "hiring",
+        "devopsjobs",
+        "techjobs",
+        "sysadminjobs",
+    ]
     seen_post_urls = set()
 
     mirror_headers = {
-        "User-Agent": "SideGigRadar/1.5 (personal-job-scanner; non-commercial)",
+        "User-Agent": "SideGigRadar/2.0 (personal-job-scanner; non-commercial)",
         "Accept": "application/json",
     }
 
@@ -258,10 +300,14 @@ def fetch_reddit_hiring_gigs() -> list:
     ):
         if not item_url or item_url in seen_post_urls:
             return
-        if "[hiring]" not in title.lower() or "[for hire]" in title.lower():
+        lower_t = title.lower()
+        # Terima [hiring] atau [task] atau judul yang jelas mencari jasa (bukan [for hire])
+        if "[for hire]" in lower_t or "for hire" in lower_t[:15]:
+            return
+        if not any(tag in lower_t for tag in ["[hiring]", "[task]", "hiring", "looking for"]):
             return
 
-        is_freelance_sub = sub.lower() in ["forhire", "freelance_forhire"]
+        is_freelance_sub = sub.lower() in ["forhire", "freelance_forhire", "hiring"]
         if is_valid_gig(title, body, is_freelance_board=is_freelance_sub, url=item_url):
             matched = extract_matched_skills(f"{title} {body}")
             if matched:
@@ -285,11 +331,11 @@ def fetch_reddit_hiring_gigs() -> list:
         fetched = False
         errors = []
 
-        # JALUR 1: Arctic Shift API
+        # JALUR 1: Arctic Shift API (limit dinaikkan ke 100)
         try:
             as_url = (
                 "https://arctic-shift.photon-reddit.com/api/posts/search"
-                f"?subreddit={sub}&limit=50&sort=desc"
+                f"?subreddit={sub}&limit=100&sort=desc"
             )
             resp = requests.get(as_url, headers=mirror_headers, timeout=15)
             resp.raise_for_status()
@@ -319,7 +365,7 @@ def fetch_reddit_hiring_gigs() -> list:
             try:
                 pp_url = (
                     "https://api.pullpush.io/reddit/search/submission/"
-                    f"?subreddit={sub}&size=50"
+                    f"?subreddit={sub}&size=100"
                 )
                 resp = requests.get(pp_url, headers=mirror_headers, timeout=15)
                 resp.raise_for_status()
@@ -349,7 +395,7 @@ def fetch_reddit_hiring_gigs() -> list:
             try:
                 gnews_url = (
                     "https://news.google.com/rss/search"
-                    f"?q=site:reddit.com/r/{sub}+%22hiring%22+when:3d&hl=en-US&gl=US&ceid=US:en"
+                    f"?q=site:reddit.com/r/{sub}+%22hiring%22+when:7d&hl=en-US&gl=US&ceid=US:en"
                 )
                 resp = requests.get(gnews_url, headers=HEADERS, timeout=15)
                 resp.raise_for_status()
@@ -376,26 +422,34 @@ def fetch_reddit_hiring_gigs() -> list:
         if not fetched:
             print(f"[-] Semua jalur Reddit (r/{sub}) gagal -> {' | '.join(errors)}")
 
-        time.sleep(1.0)
+        time.sleep(0.8)
 
     print(f"[*] Reddit [Hiring] valid: {len(jobs)} listing")
     return jobs
 
 
 def fetch_himalayas_contracts() -> list:
-    """Scout Utama 2: Proyek Part-Time / Contractor / Freelance dari Himalayas API."""
+    """Scout 2: Proyek Part-Time / Contractor / Freelance dari Himalayas API."""
     jobs = []
     try:
-        url = "https://himalayas.app/jobs/api?limit=50"
+        url = "https://himalayas.app/jobs/api?limit=100"
         resp = requests.get(url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
         res = resp.json()
 
         for item in res.get("jobs", []):
             emp_type = str(item.get("employmentType") or "").lower()
-            if not any(
+            title = str(item.get("title") or "").strip()
+            desc = re.sub(
+                r"<[^>]+>",
+                " ",
+                str(item.get("description") or item.get("excerpt") or ""),
+            )
+
+            is_explicit_contract = any(
                 k in emp_type for k in ["part", "contract", "freelance", "temp"]
-            ):
+            )
+            if not is_explicit_contract and not CONTRACT_REGEX.search(f"{title} {desc[:600]}"):
                 continue
 
             restrictions = item.get("locationRestrictions") or []
@@ -408,22 +462,16 @@ def fetch_himalayas_contracts() -> list:
             ):
                 continue
 
-            title = str(item.get("title") or "").strip()
-            desc = re.sub(
-                r"<[^>]+>",
-                " ",
-                str(item.get("description") or item.get("excerpt") or ""),
-            )
             item_url = str(item.get("applicationLink") or item.get("guid") or "")
             header_meta = f"{title} | {emp_type}"
 
             if is_valid_gig(
-                header_meta, desc, is_freelance_board=True, url=item_url
+                header_meta, desc, is_freelance_board=is_explicit_contract, url=item_url
             ):
                 matched = extract_matched_skills(f"{title} {desc}")
                 if matched:
                     jobs.append({
-                        "source": f"Himalayas ({item.get('employmentType')})",
+                        "source": f"Himalayas ({item.get('employmentType') or 'Contract'})",
                         "title": title,
                         "company": str(item.get("companyName") or "Client").strip(),
                         "url": item_url,
@@ -442,7 +490,7 @@ def fetch_hn_freelance_gigs() -> list:
     """Scout 3: Scan thread 'Seeking Freelancer' & kontrak di Hacker News."""
     jobs = []
     try:
-        url = "https://hn.algolia.com/api/v1/search_by_date?tags=story,author_whoishiring&hitsPerPage=12"
+        url = "https://hn.algolia.com/api/v1/search_by_date?tags=story,author_whoishiring&hitsPerPage=15"
         resp = requests.get(url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
         hits = resp.json().get("hits", [])
@@ -454,14 +502,14 @@ def fetch_hn_freelance_gigs() -> list:
             or "hiring" in h.get("title", "").lower()
         ]
 
-        for story in target_stories[:4]:
+        for story in target_stories[:5]:
             story_id = story["objectID"]
             story_title = story.get("title", "").lower()
             is_freelancer_thread = "freelancer" in story_title
 
             query_str = (
                 "devops OR kubernetes OR terraform OR sre OR infrastructure OR aws OR"
-                " azure OR cloud OR openshift"
+                " azure OR cloud OR openshift OR docker OR linux"
             )
             comments_url = (
                 "https://hn.algolia.com/api/v1/search_by_date"
@@ -532,7 +580,7 @@ def fetch_remotive_contracts() -> list:
 
     for cat in categories:
         try:
-            url = f"https://remotive.com/api/remote-jobs?category={cat}&limit=60"
+            url = f"https://remotive.com/api/remote-jobs?category={cat}&limit=100"
             resp = requests.get(url, headers=HEADERS, timeout=15)
             resp.raise_for_status()
 
@@ -604,7 +652,7 @@ def fetch_remoteok_contracts() -> list:
         res = resp.json()
         listings = res[1:] if isinstance(res, list) and len(res) > 1 else []
 
-        for item in listings[:100]:
+        for item in listings[:150]:
             title = str(item.get("position") or "").strip()
             tags = " ".join(str(t) for t in item.get("tags", [])).lower()
             desc = re.sub(r"<[^>]+>", " ", str(item.get("description") or ""))
@@ -627,9 +675,12 @@ def fetch_remoteok_contracts() -> list:
             ):
                 continue
 
+            is_tagged_contract = any(
+                t in tags for t in ["contract", "freelance", "part-time", "part time"]
+            )
             header_meta = f"{title} | {location} | {tags}"
             if is_valid_gig(
-                header_meta, desc, is_freelance_board=False, url=item_url
+                header_meta, desc, is_freelance_board=is_tagged_contract, url=item_url
             ):
                 matched = extract_matched_skills(f"{title} {tags} {desc}")
                 if matched:
@@ -664,7 +715,7 @@ def fetch_wwr_contracts() -> list:
             res.raise_for_status()
             items = re.findall(r"<item>(.*?)</item>", res.text, re.DOTALL)
 
-            for raw_item in items[:40]:
+            for raw_item in items[:60]:
                 title_m = re.search(
                     r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>",
                     raw_item,
@@ -716,57 +767,63 @@ def fetch_wwr_contracts() -> list:
 
 
 def fetch_jobicy_contracts() -> list:
-    """Scout 7: Listing kontrak/freelance DevOps dari Jobicy API."""
+    """Scout 7: Listing kontrak/freelance DevOps & Cloud dari Jobicy API."""
     jobs = []
-    try:
-        url = "https://jobicy.com/api/v2/remote-jobs?count=50&tag=devops"
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
+    seen_urls = set()
+    for tag in ["devops", "cloud", "sysadmin"]:
+        try:
+            url = f"https://jobicy.com/api/v2/remote-jobs?count=50&tag={tag}"
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+            resp.raise_for_status()
 
-        for item in resp.json().get("jobs", []):
-            title = str(item.get("jobTitle") or "").strip()
-            job_type = (
-                " ".join(item.get("jobType", [])).lower()
-                if isinstance(item.get("jobType"), list)
-                else str(item.get("jobType") or "").lower()
-            )
-            geo = str(item.get("jobGeo") or "").lower()
-            desc = re.sub(
-                r"<[^>]+>",
-                " ",
-                str(item.get("jobDescription") or item.get("jobExcerpt") or ""),
-            )
-            item_url = str(item.get("url") or "")
+            for item in resp.json().get("jobs", []):
+                item_url = str(item.get("url") or "")
+                if not item_url or item_url in seen_urls:
+                    continue
+                seen_urls.add(item_url)
 
-            if geo and not any(
-                term in geo
-                for term in ["anywhere", "worldwide", "global", "apac", "asia"]
-            ):
-                continue
+                title = str(item.get("jobTitle") or "").strip()
+                job_type = (
+                    " ".join(item.get("jobType", [])).lower()
+                    if isinstance(item.get("jobType"), list)
+                    else str(item.get("jobType") or "").lower()
+                )
+                geo = str(item.get("jobGeo") or "").lower()
+                desc = re.sub(
+                    r"<[^>]+>",
+                    " ",
+                    str(item.get("jobDescription") or item.get("jobExcerpt") or ""),
+                )
 
-            is_contract_type = any(
-                t in job_type for t in ["contract", "freelance", "part-time"]
-            )
-            header_meta = f"{title} | {geo} | {job_type}"
-            if is_valid_gig(
-                header_meta,
-                desc,
-                is_freelance_board=is_contract_type,
-                url=item_url,
-            ):
-                matched = extract_matched_skills(f"{title} {desc}")
-                if matched:
-                    jobs.append({
-                        "source": "Jobicy (Contract)",
-                        "title": title,
-                        "company": str(item.get("companyName") or "Client").strip(),
-                        "url": item_url,
-                        "date": str(item.get("pubDate") or "")[:10],
-                        "matches": matched,
-                        "description": desc[:1500],
-                    })
-    except Exception as e:
-        print(f"[-] Jobicy error: {e}")
+                if geo and not any(
+                    term in geo
+                    for term in ["anywhere", "worldwide", "global", "apac", "asia"]
+                ):
+                    continue
+
+                is_contract_type = any(
+                    t in job_type for t in ["contract", "freelance", "part-time"]
+                )
+                header_meta = f"{title} | {geo} | {job_type}"
+                if is_valid_gig(
+                    header_meta,
+                    desc,
+                    is_freelance_board=is_contract_type,
+                    url=item_url,
+                ):
+                    matched = extract_matched_skills(f"{title} {desc}")
+                    if matched:
+                        jobs.append({
+                            "source": "Jobicy (Contract)",
+                            "title": title,
+                            "company": str(item.get("companyName") or "Client").strip(),
+                            "url": item_url,
+                            "date": str(item.get("pubDate") or "")[:10],
+                            "matches": matched,
+                            "description": desc[:1500],
+                        })
+        except Exception as e:
+            print(f"[-] Jobicy ({tag}) error: {e}")
 
     print(f"[*] Jobicy kontrak/freelance valid: {len(jobs)} listing")
     return jobs
@@ -780,7 +837,7 @@ def fetch_workingnomads_contracts() -> list:
         resp = requests.get(url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
 
-        for item in resp.json()[:150]:
+        for item in resp.json()[:200]:
             cat = str(item.get("category_name") or "").lower()
             if "devops" not in cat and "system" not in cat and "development" not in cat:
                 continue
@@ -816,6 +873,53 @@ def fetch_workingnomads_contracts() -> list:
         print(f"[-] WorkingNomads error: {e}")
 
     print(f"[*] WorkingNomads kontrak valid: {len(jobs)} listing")
+    return jobs
+
+
+def fetch_github_bounties_and_gigs() -> list:
+    """Scout 9 (BARU): Issue GitHub publik bertag bounty / paid / freelance di ekosistem Cloud/K8s/Terraform."""
+    jobs = []
+    queries = [
+        'is:issue is:open label:bounty (kubernetes OR terraform OR helm OR docker OR devops)',
+        'is:issue is:open "paid" ("devops" OR "kubernetes" OR "terraform" OR "github actions")',
+    ]
+    seen_urls = set()
+
+    for q in queries:
+        try:
+            url = f"https://api.github.com/search/issues?q={requests.utils.quote(q)}&sort=created&order=desc&per_page=20"
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+            if resp.status_code == 403:
+                continue
+            resp.raise_for_status()
+
+            for item in resp.json().get("items", []):
+                item_url = str(item.get("html_url") or "")
+                if not item_url or item_url in seen_urls:
+                    continue
+                seen_urls.add(item_url)
+
+                title = str(item.get("title") or "").strip()
+                body = str(item.get("body") or "")[:1500]
+                repo_url = str(item.get("repository_url") or "")
+                repo_name = "/".join(repo_url.split("/")[-2:]) if repo_url else "GitHub Repo"
+
+                if is_valid_gig(title, body, is_freelance_board=True, url=item_url):
+                    matched = extract_matched_skills(f"{title} {body}")
+                    if matched:
+                        jobs.append({
+                            "source": "GitHub Bounty/Task",
+                            "title": f"[{repo_name}] {title}",
+                            "company": repo_name.split("/")[0],
+                            "url": item_url,
+                            "date": str(item.get("created_at") or "")[:10],
+                            "matches": matched,
+                            "description": body or title,
+                        })
+        except Exception as e:
+            print(f"[-] GitHub Bounty error: {e}")
+
+    print(f"[*] GitHub Bounty/Task valid: {len(jobs)} listing")
     return jobs
 
 
@@ -883,25 +987,26 @@ def generate_with_fallback(
 def agent_quality_control(client, job: dict) -> dict:
     """Karyawan 1 (QC Gatekeeper): Menilai kelayakan side-gig lebih dulu sebelum generate pitch."""
     prompt = f"""
-You are a strict QC Manager for a Senior Cloud/DevOps Side-Gig Sniper pipeline.
-The candidate currently holds a daytime full-time Cloud Engineer role (GMT+7 / Jakarta) and ONLY wants safe, non-conflicting side gigs with direct clients (NOT talent agencies/marketplaces/aggregators).
+You are a pragmatic QC Manager for a Senior Cloud/DevOps Side-Gig Sniper pipeline.
+The candidate currently holds a daytime full-time Cloud Engineer role (GMT+7 / Jakarta) and wants legitimate freelance, contract, B2B, or bounty side gigs with direct clients (NOT talent agencies/marketplaces/aggregators).
 
 Evaluate this gig:
 Title: {job['title']}
 Source: {job['source']}
 URL: {job['url']}
-Details: {job.get('description', '')[:1000]}
+Details: {job.get('description', '')[:1200]}
 
 Scoring Criteria (1-10):
-- Give 8-10 ONLY IF:
-  1) It is a direct client side-gig (part-time, fractional, project-based, bounty, or async contract <= 15-20 hrs/week) WITHOUT interfering with a daytime full-time job.
-  2) Globally remote-friendly (open to APAC/Indonesia, no mandatory 9-to-5 US/EU synchronous meetings).
-  3) Does NOT require the freelancer to pay out-of-pocket for AI subscriptions/API keys (no BYOK).
-  4) Strongly matches Cloud/K8s/Terraform/SRE/AI-infra skills.
-- Give 1-7 IF:
-  1) It is a disguised full-time role (35-40 hrs/week), a link-farm/aggregator post, a talent agency/marketplace ad, or demands rigid synchronous overlap during daytime/late-night GMT+7.
-  2) Has hidden country restrictions (US/EU/UK only) or requires BYOK paid subscriptions.
-  3) Vague or low-value gig.
+- Give 8-10 IF:
+  1) Clearly a freelance, part-time, fractional, project-based, bounty, or async contract (<= 20 hrs/week) safe alongside a daytime full-time job.
+  2) Globally remote-friendly (open to APAC/Indonesia, async-first).
+  3) Does NOT require paying out-of-pocket for AI subscriptions/API keys (no BYOK).
+  4) Strong match with Cloud/K8s/Terraform/CI-CD/Linux/SRE/AI-infra.
+- Give 7 IF:
+  1) Legitimate direct-client B2B contract or flexible remote role where async/part-time arrangement can be pitched, even if hours aren't explicitly capped at 20/wk—as long as it does NOT demand strict US/EU synchronous business hours or explicit 40h/wk W2 employment.
+- Give 1-6 IF:
+  1) Disguised rigid 40h/wk full-time employee role, link-farm/aggregator post, talent agency/marketplace ad, or demands strict daytime/late-night GMT+7 synchronous overlap.
+  2) Hidden country restrictions (US/EU/UK only) or requires BYOK paid subscriptions.
 
 Output STRICTLY valid JSON without markdown blocks:
 {{"score": 8, "reason": "Alasan singkat dalam bahasa Indonesia (sebutkan estimasi fleksibilitas waktunya)", "approved": true}}
@@ -911,8 +1016,8 @@ Output STRICTLY valid JSON without markdown blocks:
         clean_json = raw_res.replace("```json", "").replace("```", "").strip()
         return json.loads(clean_json)
     except Exception as e:
-        print(f"[!] Warning QC parse gagal ({e}), fallback skor 7.")
-        return {"score": 7, "reason": "Fallback QC parse", "approved": False}
+        print(f"[!] Warning QC parse gagal ({e}), fallback skor 6.")
+        return {"score": 6, "reason": "Fallback QC parse", "approved": False}
 
 
 def agent_solutions_architect(client, job: dict) -> str:
@@ -944,8 +1049,9 @@ def main():
     print(f"[*] Total history seen URLs: {len(seen_urls)}")
 
     all_jobs = []
-    # Sumber prioritas tinggi khusus freelance & kontrak pendek
+    # Sumber prioritas tinggi khusus freelance, task, & kontrak pendek
     all_jobs.extend(fetch_reddit_hiring_gigs())
+    all_jobs.extend(fetch_github_bounties_and_gigs())
     all_jobs.extend(fetch_himalayas_contracts())
     # Sumber sekunder (HN bulanan & job boards)
     all_jobs.extend(fetch_hn_freelance_gigs())
@@ -980,7 +1086,8 @@ def main():
         print("[!] Tidak ada proyek side-gig aman hari ini. Bot standby.")
         return
 
-    candidates = unique_new_jobs[:5]
+    # Dinaikkan dari 5 menjadi 12 kandidat per run agar lebih banyak peluang dievaluasi AI
+    candidates = unique_new_jobs[:12]
 
     if not GEMINI_API_KEY:
         print("[!] GEMINI_API_KEY belum diset. Mengirim mode radar standar...")
@@ -1006,7 +1113,7 @@ def main():
             print(f"    -> QC Skor: {score}/10 | {reason}")
             evaluated_urls.add(job["url"])
 
-            if score >= 8 and qc.get("approved", False):
+            if score >= MIN_QC_SCORE and (qc.get("approved", False) or score >= 7):
                 print("    -> Lolos QC! Meracik async pitch...")
                 pitch = agent_solutions_architect(client, job)
                 job["ai_pitch"] = pitch
@@ -1014,19 +1121,19 @@ def main():
                 job["qc_reason"] = reason
                 approved_gigs.append(job)
 
-            time.sleep(2)
+            time.sleep(1.5)
         except Exception as e:
             print(f"[-] Gagal memproses kandidat via AI: {e}")
 
     if not approved_gigs:
         seen_urls.update(evaluated_urls)
         save_seen_urls(seen_urls)
-        print("🛑 Tidak ada prospek side-gig yang lolos QC (skor >= 8) hari ini. Telegram tidak di-spam.")
+        print(f"🛑 Tidak ada prospek side-gig yang lolos QC (skor >= {MIN_QC_SCORE}) hari ini. Telegram tidak di-spam.")
         return
 
     message = (
         "<b>🎯 ASYNC SIDE-GIG BRIEFING (QC APPROVED)</b>\n"
-        "<i>Aman untuk full-time • Skor ≥ 8 • Pitch siap copas</i>\n"
+        f"<i>Aman untuk full-time • Skor ≥ {MIN_QC_SCORE} • Pitch siap copas</i>\n"
         "====================================\n\n"
     )
 
